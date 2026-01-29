@@ -149,12 +149,6 @@ test-ollama = []
 mini-dashboard = [
     "static-files",
     "anyhow",
-    "cargo_toml",
-    "hex",
-    "reqwest",
-    "sha-1",
-    "tempfile",
-    "zip",
 ]
 chinese = ["meilisearch-types/chinese"]
 chinese-pinyin = ["meilisearch-types/chinese-pinyin"]
@@ -170,6 +164,5 @@ swedish-recomposition = ["meilisearch-types/swedish-recomposition"]
 german = ["meilisearch-types/german"]
 turkish = ["meilisearch-types/turkish"]
 
-[package.metadata.mini-dashboard]
-assets-url = "https://github.com/meilisearch/mini-dashboard/releases/download/v0.3.0/build.zip"
-sha1 = "cdd17ac43cd57d8bf1a889759644200f74514fba"
+# Dashboard is built locally from dashboard/ directory
+# Run 'npm run build' in dashboard/ to update assets
