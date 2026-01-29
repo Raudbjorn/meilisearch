@@ -239,6 +239,8 @@ pub enum ChatCompletionSource {
     AzureOpenAi,
     /// vLLM compatible API
     VLlm,
+    /// Anthropic Claude API
+    Anthropic,
 }
 
 impl From<ChatCompletionSource> for DbChatCompletionSource {
@@ -249,6 +251,7 @@ impl From<ChatCompletionSource> for DbChatCompletionSource {
             Mistral => DbChatCompletionSource::Mistral,
             AzureOpenAi => DbChatCompletionSource::AzureOpenAi,
             VLlm => DbChatCompletionSource::VLlm,
+            Anthropic => DbChatCompletionSource::Anthropic,
         }
     }
 }

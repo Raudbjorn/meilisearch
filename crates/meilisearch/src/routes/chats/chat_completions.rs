@@ -14,8 +14,9 @@ use async_openai::types::{
     ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
     ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
     ChatCompletionStreamOptions, ChatCompletionStreamResponseDelta, ChatCompletionToolArgs,
-    ChatCompletionToolType, CreateChatCompletionRequest, CreateChatCompletionStreamResponse,
-    FinishReason, FunctionCall, FunctionCallStream, FunctionObjectArgs,
+    ChatCompletionToolType, CreateChatCompletionRequest, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionCallStream,
+    FunctionObjectArgs,
 };
 use async_openai::Client;
 use bumpalo::Bump;
@@ -355,14 +356,13 @@ async fn process_search_request(
     Ok((index, documents, text))
 }
 
-#[allow(unreachable_code, unused_variables)] // will be correctly implemented in the future
 async fn non_streamed_chat(
     index_scheduler: GuardedData<ActionPolicy<{ actions::CHAT_COMPLETIONS }>, Data<IndexScheduler>>,
     auth_ctrl: web::Data<AuthController>,
     search_queue: web::Data<SearchQueue>,
     workspace_uid: &str,
     req: HttpRequest,
-    chat_completion: CreateChatCompletionRequest,
+    mut chat_completion: CreateChatCompletionRequest,
     analytics: web::Data<Analytics>,
 ) -> Result<HttpResponse, ResponseError> {
     index_scheduler.features().check_chat_completions("using the /chats chat completions route")?;
@@ -382,13 +382,8 @@ async fn non_streamed_chat(
         ));
     }
 
-    return Err(ResponseError::from_msg(
-        "Non-streamed chat completions is not implemented".to_string(),
-        Code::UnimplementedNonStreamingChatCompletions,
-    ));
-
     let filters = index_scheduler.filters();
-    let chat_settings = match index_scheduler.chat_settings(workspace_uid).unwrap() {
+    let chat_settings = match index_scheduler.chat_settings(workspace_uid)? {
         Some(settings) => settings,
         None => {
             return Err(ResponseError::from_msg(
@@ -398,11 +393,8 @@ async fn non_streamed_chat(
         }
     };
 
-    let config = Config::new(&chat_settings);
-    let client = Client::with_config(index_scheduler.ip_policy().clone(), config);
     let auth_token = extract_token_from_request(&req)?.unwrap();
     let system_role = chat_settings.source.system_role(&chat_completion.model);
-    // TODO do function support later
     let _function_support = setup_search_tool(
         &index_scheduler,
         filters,
@@ -411,9 +403,86 @@ async fn non_streamed_chat(
         system_role,
     )?;
 
+    let source = chat_settings.source;
+
+    // Branch based on source type: Anthropic uses a dedicated client
+    let response = if source == DbChatCompletionSource::Anthropic {
+        // Build Anthropic config from settings
+        let anthropic_config = AnthropicConfig::from_settings(&chat_settings)
+            .map_err(|e| ResponseError::from_msg(e.to_string(), Code::BadRequest))?;
+        let client = AnthropicClient::new(anthropic_config, index_scheduler.ip_policy().clone());
+
+        run_anthropic_non_streamed_conversation(
+            &index_scheduler,
+            &auth_ctrl,
+            workspace_uid,
+            &search_queue,
+            auth_token,
+            &client,
+            &mut chat_completion,
+        )
+        .await?
+    } else {
+        // OpenAI, Azure, Mistral, vLLM path
+        let config = Config::new(&chat_settings);
+        let client = Client::with_config(index_scheduler.ip_policy().clone(), config);
+
+        run_openai_non_streamed_conversation(
+            &index_scheduler,
+            &auth_ctrl,
+            workspace_uid,
+            &search_queue,
+            auth_token,
+            &client,
+            &mut chat_completion,
+        )
+        .await?
+    };
+
+    // Record success in analytics
+    let mut aggregate = aggregate;
+    aggregate.succeed(start_time.elapsed());
+    analytics.publish(aggregate, &req);
+
+    Ok(HttpResponse::Ok().json(response))
+}
+
+/// Run the non-streaming conversation loop for OpenAI-compatible providers.
+#[allow(clippy::too_many_arguments)]
+async fn run_openai_non_streamed_conversation<C: async_openai::config::Config>(
+    index_scheduler: &GuardedData<
+        ActionPolicy<{ actions::CHAT_COMPLETIONS }>,
+        Data<IndexScheduler>,
+    >,
+    auth_ctrl: &web::Data<AuthController>,
+    workspace_uid: &str,
+    search_queue: &web::Data<SearchQueue>,
+    auth_token: &str,
+    client: &Client<C>,
+    chat_completion: &mut CreateChatCompletionRequest,
+) -> Result<CreateChatCompletionResponse, ResponseError> {
     let mut response;
-    loop {
-        response = client.chat().create(chat_completion.clone()).await.unwrap();
+
+    // Limit the number of internal calls to satisfy the search requests of the LLM
+    for _ in 0..20 {
+        response = client
+            .chat()
+            .create(chat_completion.clone())
+            .await
+            .map_err(|e| ResponseError::from_msg(e.to_string(), Code::BadRequest))?;
+
+        // Track token usage
+        if let Some(usage) = response.usage.as_ref() {
+            MEILISEARCH_CHAT_PROMPT_TOKENS_TOTAL
+                .with_label_values(&[workspace_uid, &chat_completion.model])
+                .inc_by(usage.prompt_tokens as u64);
+            MEILISEARCH_CHAT_COMPLETION_TOKENS_TOTAL
+                .with_label_values(&[workspace_uid, &chat_completion.model])
+                .inc_by(usage.completion_tokens as u64);
+            MEILISEARCH_CHAT_TOKENS_TOTAL
+                .with_label_values(&[workspace_uid, &chat_completion.model])
+                .inc_by(usage.total_tokens as u64);
+        }
 
         let choice = &mut response.choices[0];
         match choice.finish_reason {
@@ -436,9 +505,9 @@ async fn non_streamed_chat(
                     let result = match serde_json::from_str(&call.function.arguments) {
                         Ok(SearchInIndexParameters { index_uid, q, filter }) => {
                             process_search_request(
-                                &index_scheduler,
+                                index_scheduler,
                                 auth_ctrl.clone(),
-                                &search_queue,
+                                search_queue,
                                 auth_token,
                                 index_uid,
                                 q,
@@ -450,7 +519,6 @@ async fn non_streamed_chat(
                         Err(err) => Err(err.to_string()),
                     };
 
-                    // TODO report documents sources later
                     let answer = match result {
                         Ok((_, _documents, text)) => text,
                         Err(err) => err,
@@ -467,19 +535,119 @@ async fn non_streamed_chat(
                 // Let the client call other tools by themselves
                 if !other_calls.is_empty() {
                     response.choices[0].message.tool_calls = Some(other_calls);
-                    break;
+                    return Ok(response);
                 }
             }
-            _ => break,
+            _ => return Ok(response),
         }
     }
 
-    // Record success in analytics
-    let mut aggregate = aggregate;
-    aggregate.succeed(start_time.elapsed());
-    analytics.publish(aggregate, &req);
+    // If we hit the limit, return the last response
+    Err(ResponseError::from_msg(
+        "Maximum number of tool call iterations reached".to_string(),
+        Code::BadRequest,
+    ))
+}
 
-    Ok(HttpResponse::Ok().json(response))
+/// Run the non-streaming conversation loop for Anthropic.
+#[allow(clippy::too_many_arguments)]
+async fn run_anthropic_non_streamed_conversation(
+    index_scheduler: &GuardedData<
+        ActionPolicy<{ actions::CHAT_COMPLETIONS }>,
+        Data<IndexScheduler>,
+    >,
+    auth_ctrl: &web::Data<AuthController>,
+    workspace_uid: &str,
+    search_queue: &web::Data<SearchQueue>,
+    auth_token: &str,
+    client: &AnthropicClient,
+    chat_completion: &mut CreateChatCompletionRequest,
+) -> Result<CreateChatCompletionResponse, ResponseError> {
+    let mut response;
+
+    // Limit the number of internal calls to satisfy the search requests of the LLM
+    for _ in 0..20 {
+        response = client.create(chat_completion.clone()).await.map_err(|e| {
+            let stream_error = e.into_stream_error_event();
+            ResponseError::from_msg(stream_error.error.message, Code::BadRequest)
+        })?;
+
+        // Track token usage
+        if let Some(usage) = response.usage.as_ref() {
+            MEILISEARCH_CHAT_PROMPT_TOKENS_TOTAL
+                .with_label_values(&[workspace_uid, &chat_completion.model])
+                .inc_by(usage.prompt_tokens as u64);
+            MEILISEARCH_CHAT_COMPLETION_TOKENS_TOTAL
+                .with_label_values(&[workspace_uid, &chat_completion.model])
+                .inc_by(usage.completion_tokens as u64);
+            MEILISEARCH_CHAT_TOKENS_TOTAL
+                .with_label_values(&[workspace_uid, &chat_completion.model])
+                .inc_by(usage.total_tokens as u64);
+        }
+
+        let choice = &mut response.choices[0];
+        match choice.finish_reason {
+            Some(FinishReason::ToolCalls) => {
+                let tool_calls = mem::take(&mut choice.message.tool_calls).unwrap_or_default();
+
+                let (meili_calls, other_calls): (Vec<_>, Vec<_>) = tool_calls
+                    .into_iter()
+                    .partition(|call| call.function.name == MEILI_SEARCH_IN_INDEX_FUNCTION_NAME);
+
+                chat_completion.messages.push(
+                    ChatCompletionRequestAssistantMessageArgs::default()
+                        .tool_calls(meili_calls.clone())
+                        .build()
+                        .unwrap()
+                        .into(),
+                );
+
+                for call in meili_calls {
+                    let result = match serde_json::from_str(&call.function.arguments) {
+                        Ok(SearchInIndexParameters { index_uid, q, filter }) => {
+                            process_search_request(
+                                index_scheduler,
+                                auth_ctrl.clone(),
+                                search_queue,
+                                auth_token,
+                                index_uid,
+                                q,
+                                filter,
+                            )
+                            .await
+                            .map_err(|e| e.to_string())
+                        }
+                        Err(err) => Err(err.to_string()),
+                    };
+
+                    let answer = match result {
+                        Ok((_, _documents, text)) => text,
+                        Err(err) => err,
+                    };
+
+                    chat_completion.messages.push(ChatCompletionRequestMessage::Tool(
+                        ChatCompletionRequestToolMessage {
+                            tool_call_id: call.id.clone(),
+                            content: ChatCompletionRequestToolMessageContent::Text(answer),
+                        },
+                    ));
+                }
+
+                // Let the client call other tools by themselves
+                if !other_calls.is_empty() {
+                    response.choices[0].message.tool_calls = Some(other_calls);
+                    return Ok(response);
+                }
+            }
+            _ => return Ok(response),
+        }
+    }
+
+    // If we hit the limit, return the last response
+    Err(ResponseError::from_msg(
+        "Maximum number of tool call iterations reached".to_string(),
+        Code::BadRequest,
+    ))
 }
 
 async fn streamed_chat(
@@ -519,7 +687,6 @@ async fn streamed_chat(
     );
     let start_time = std::time::Instant::now();
 
-    let config = Config::new(&chat_settings);
     let auth_token = extract_token_from_request(&req)?.unwrap().to_string();
     let system_role = chat_settings.source.system_role(&chat_completion.model);
     let function_support = setup_search_tool(
@@ -540,18 +707,23 @@ async fn streamed_chat(
     // Branch based on source type: Anthropic uses a dedicated client
     let _join_handle = if source == DbChatCompletionSource::Anthropic {
         // Build Anthropic config from settings
-        let anthropic_config = match AnthropicConfig::from_settings(&chat_settings) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = tx.send_error(&StreamErrorEvent::from_response_error(
-                    ResponseError::from_msg(e.to_string(), Code::BadRequest),
-                )).await;
-                return Ok(Sse::from_infallible_receiver(rx).with_retry_duration(Duration::from_secs(10)));
-            }
-        };
+        let anthropic_config =
+            match AnthropicConfig::from_settings(&chat_settings) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx
+                        .send_error(&StreamErrorEvent::from_response_error(
+                            ResponseError::from_msg(e.to_string(), Code::BadRequest),
+                        ))
+                        .await;
+                    return Ok(Sse::from_infallible_receiver(rx)
+                        .with_retry_duration(Duration::from_secs(10)));
+                }
+            };
 
         Handle::current().spawn(async move {
-            let client = AnthropicClient::new(anthropic_config, index_scheduler.ip_policy().clone());
+            let client =
+                AnthropicClient::new(anthropic_config, index_scheduler.ip_policy().clone());
             let mut global_tool_calls = HashMap::<u32, Call>::new();
 
             // Limit the number of internal calls to satisfy the search requests of the LLM
@@ -580,8 +752,9 @@ async fn streamed_chat(
             let _ = tx.stop().await;
         })
     } else {
+        let config = Config::new(&chat_settings);
         Handle::current().spawn(async move {
-            let client = Client::with_config(index_scheduler.ip_policy().clone(), config.clone());
+            let client = Client::with_config(index_scheduler.ip_policy().clone(), config);
             let mut global_tool_calls = HashMap::<u32, Call>::new();
 
             // Limit the number of internal calls to satisfy the search requests of the LLM
