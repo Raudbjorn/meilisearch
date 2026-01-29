@@ -40,6 +40,7 @@ use serde_json::json;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::SendError;
 
+use super::anthropic::{AnthropicClient, AnthropicConfig};
 use super::chat_completion_analytics::ChatCompletionAggregator;
 use super::config::Config;
 use super::errors::{MistralError, OpenAiOutsideError, StreamErrorEvent};
@@ -534,36 +535,82 @@ async fn streamed_chat(
     let (tx, rx) = tokio::sync::mpsc::channel(10);
     let tx = SseEventSender::new(tx);
     let workspace_uid = workspace_uid.to_string();
-    let _join_handle = Handle::current().spawn(async move {
-        let client = Client::with_config(index_scheduler.ip_policy().clone(), config.clone());
-        let mut global_tool_calls = HashMap::<u32, Call>::new();
+    let source = chat_settings.source;
 
-        // Limit the number of internal calls to satisfy the search requests of the LLM
-        for _ in 0..20 {
-            let output = run_conversation(
-                &index_scheduler,
-                &auth_ctrl,
-                &workspace_uid,
-                &search_queue,
-                &auth_token,
-                &client,
-                chat_settings.source,
-                &mut chat_completion,
-                &tx,
-                &mut global_tool_calls,
-                function_support,
-            );
-
-            match output.await {
-                Ok(ControlFlow::Continue(())) => (),
-                Ok(ControlFlow::Break(_finish_reason)) => break,
-                // If the connection is closed we must stop
-                Err(SendError(_)) => return,
+    // Branch based on source type: Anthropic uses a dedicated client
+    let _join_handle = if source == DbChatCompletionSource::Anthropic {
+        // Build Anthropic config from settings
+        let anthropic_config = match AnthropicConfig::from_settings(&chat_settings) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send_error(&StreamErrorEvent::from_response_error(
+                    ResponseError::from_msg(e.to_string(), Code::BadRequest),
+                )).await;
+                return Ok(Sse::from_infallible_receiver(rx).with_retry_duration(Duration::from_secs(10)));
             }
-        }
+        };
 
-        let _ = tx.stop().await;
-    });
+        Handle::current().spawn(async move {
+            let client = AnthropicClient::new(anthropic_config, index_scheduler.ip_policy().clone());
+            let mut global_tool_calls = HashMap::<u32, Call>::new();
+
+            // Limit the number of internal calls to satisfy the search requests of the LLM
+            for _ in 0..20 {
+                let output = run_anthropic_conversation(
+                    &index_scheduler,
+                    &auth_ctrl,
+                    &workspace_uid,
+                    &search_queue,
+                    &auth_token,
+                    &client,
+                    &mut chat_completion,
+                    &tx,
+                    &mut global_tool_calls,
+                    function_support,
+                );
+
+                match output.await {
+                    Ok(ControlFlow::Continue(())) => (),
+                    Ok(ControlFlow::Break(_finish_reason)) => break,
+                    // If the connection is closed we must stop
+                    Err(SendError(_)) => return,
+                }
+            }
+
+            let _ = tx.stop().await;
+        })
+    } else {
+        Handle::current().spawn(async move {
+            let client = Client::with_config(index_scheduler.ip_policy().clone(), config.clone());
+            let mut global_tool_calls = HashMap::<u32, Call>::new();
+
+            // Limit the number of internal calls to satisfy the search requests of the LLM
+            for _ in 0..20 {
+                let output = run_conversation(
+                    &index_scheduler,
+                    &auth_ctrl,
+                    &workspace_uid,
+                    &search_queue,
+                    &auth_token,
+                    &client,
+                    source,
+                    &mut chat_completion,
+                    &tx,
+                    &mut global_tool_calls,
+                    function_support,
+                );
+
+                match output.await {
+                    Ok(ControlFlow::Continue(())) => (),
+                    Ok(ControlFlow::Break(_finish_reason)) => break,
+                    // If the connection is closed we must stop
+                    Err(SendError(_)) => return,
+                }
+            }
+
+            let _ = tx.stop().await;
+        })
+    };
 
     // Record success in analytics after the stream is set up
     aggregate.succeed(start_time.elapsed());
@@ -596,7 +643,7 @@ async fn run_conversation<C: async_openai::config::Config>(
     let mut finish_reason = None;
     chat_completion.stream_options = match source {
         OpenAi | AzureOpenAi => Some(ChatCompletionStreamOptions { include_usage: true }),
-        Mistral | VLlm => None,
+        Mistral | VLlm | Anthropic => None,
     };
 
     // safety: unwrap: can only happens if `stream` was set to `false`
@@ -881,4 +928,153 @@ fn format_facet_distributions(
     }
 
     Ok(output)
+}
+
+// ============================================================================
+// Anthropic-specific conversation handler
+// ============================================================================
+
+/// Updates the chat completion with the new messages, streams the LLM tokens,
+/// and report progress and errors for Anthropic.
+#[allow(clippy::too_many_arguments)]
+async fn run_anthropic_conversation(
+    index_scheduler: &GuardedData<
+        ActionPolicy<{ actions::CHAT_COMPLETIONS }>,
+        Data<IndexScheduler>,
+    >,
+    auth_ctrl: &web::Data<AuthController>,
+    workspace_uid: &str,
+    search_queue: &web::Data<SearchQueue>,
+    auth_token: &str,
+    client: &AnthropicClient,
+    chat_completion: &mut CreateChatCompletionRequest,
+    tx: &SseEventSender,
+    global_tool_calls: &mut HashMap<u32, Call>,
+    function_support: FunctionSupport,
+) -> Result<ControlFlow<Option<FinishReason>, ()>, SendError<Event>> {
+    let mut finish_reason = None;
+
+    // Anthropic doesn't support stream_options like OpenAI
+    chat_completion.stream_options = None;
+
+    // Create the stream using Anthropic client
+    let mut response = match client.create_stream(chat_completion.clone()).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            tx.send_error(&error.into_stream_error_event()).await?;
+            return Ok(ControlFlow::Break(None));
+        }
+    };
+
+    while let Some(result) = response.next().await {
+        match result {
+            Ok(resp) => {
+                if let Some(usage) = resp.usage.as_ref() {
+                    MEILISEARCH_CHAT_PROMPT_TOKENS_TOTAL
+                        .with_label_values(&[workspace_uid, &chat_completion.model])
+                        .inc_by(usage.prompt_tokens as u64);
+                    MEILISEARCH_CHAT_COMPLETION_TOKENS_TOTAL
+                        .with_label_values(&[workspace_uid, &chat_completion.model])
+                        .inc_by(usage.completion_tokens as u64);
+                    MEILISEARCH_CHAT_TOKENS_TOTAL
+                        .with_label_values(&[workspace_uid, &chat_completion.model])
+                        .inc_by(usage.total_tokens as u64);
+                }
+                let choice = match resp.choices.first() {
+                    Some(choice) => choice,
+                    None => break,
+                };
+                finish_reason = choice.finish_reason;
+
+                let ChatCompletionStreamResponseDelta { ref tool_calls, .. } = &choice.delta;
+
+                match tool_calls {
+                    Some(tool_calls) => {
+                        for chunk in tool_calls {
+                            let ChatCompletionMessageToolCallChunk {
+                                index,
+                                id,
+                                r#type: _,
+                                function,
+                            } = chunk;
+                            let FunctionCallStream { name, arguments } = function.as_ref().unwrap();
+
+                            global_tool_calls
+                                .entry(*index)
+                                .and_modify(|call| {
+                                    if call.is_internal() {
+                                        call.append(arguments.as_ref().unwrap())
+                                    }
+                                })
+                                .or_insert_with(|| {
+                                    if name.as_deref() == Some(MEILI_SEARCH_IN_INDEX_FUNCTION_NAME)
+                                    {
+                                        Call::Internal {
+                                            id: id.as_ref().unwrap().clone(),
+                                            function_name: name.as_ref().unwrap().clone(),
+                                            arguments: arguments.as_ref().unwrap().clone(),
+                                        }
+                                    } else {
+                                        Call::External
+                                    }
+                                });
+                        }
+                    }
+                    None => {
+                        if !global_tool_calls.is_empty() {
+                            let (meili_calls, _other_calls): (Vec<_>, Vec<_>) =
+                                mem::take(global_tool_calls)
+                                    .into_values()
+                                    .flat_map(|call| match call {
+                                        Call::Internal { id, function_name: name, arguments } => {
+                                            Some(ChatCompletionMessageToolCall {
+                                                id,
+                                                r#type: Some(ChatCompletionToolType::Function),
+                                                function: FunctionCall { name, arguments },
+                                            })
+                                        }
+                                        Call::External => None,
+                                    })
+                                    .partition(|call| {
+                                        call.function.name == MEILI_SEARCH_IN_INDEX_FUNCTION_NAME
+                                    });
+
+                            chat_completion.messages.push(
+                                ChatCompletionRequestAssistantMessageArgs::default()
+                                    .tool_calls(meili_calls.clone())
+                                    .build()
+                                    .unwrap()
+                                    .into(),
+                            );
+
+                            handle_meili_tools(
+                                index_scheduler,
+                                auth_ctrl,
+                                search_queue,
+                                auth_token,
+                                tx,
+                                meili_calls,
+                                chat_completion,
+                                &resp,
+                                function_support,
+                            )
+                            .await?;
+                        } else {
+                            tx.forward_response(&resp).await?;
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                tx.send_error(&error.into_stream_error_event()).await?;
+                return Ok(ControlFlow::Break(None));
+            }
+        }
+    }
+
+    // We must stop if the finish reason is not something we can solve with Meilisearch
+    match finish_reason {
+        Some(FinishReason::ToolCalls) => Ok(ControlFlow::Continue(())),
+        otherwise => Ok(ControlFlow::Break(otherwise)),
+    }
 }

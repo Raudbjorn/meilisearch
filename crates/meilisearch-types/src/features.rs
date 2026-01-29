@@ -99,6 +99,7 @@ pub enum ChatCompletionSource {
     AzureOpenAi,
     Mistral,
     VLlm,
+    Anthropic,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +119,7 @@ impl ChatCompletionSource {
             AzureOpenAi => Developer,
             Mistral => System,
             VLlm => System,
+            Anthropic => System, // Anthropic uses "user" role, system prompt is separate
         }
     }
 
@@ -136,6 +138,7 @@ impl ChatCompletionSource {
         match self {
             OpenAi => Some("https://api.openai.com/v1/"),
             Mistral => Some("https://api.mistral.ai/v1/"),
+            Anthropic => Some("https://api.anthropic.com/v1/"),
             AzureOpenAi | VLlm => None,
         }
     }

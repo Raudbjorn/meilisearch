@@ -10,9 +10,15 @@ pub enum Config {
 }
 
 impl Config {
+    /// Creates a config for OpenAI-compatible providers.
+    ///
+    /// # Panics
+    /// Panics if called for Anthropic source. Use `is_anthropic()` to check first.
     pub fn new(chat_settings: &DbChatSettings) -> Self {
         use meilisearch_types::features::ChatCompletionSource::*;
         match chat_settings.source {
+            // Anthropic uses its own client, not async_openai
+            Anthropic => panic!("Config::new should not be called for Anthropic source"),
             OpenAi | Mistral | VLlm => {
                 let mut config = OpenAIConfig::default();
                 if let Some(org_id) = chat_settings.org_id.as_ref() {
