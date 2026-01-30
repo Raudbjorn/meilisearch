@@ -32,3 +32,4 @@ crates/milli/fuzz/update::facet::incremental::fuzz::fuzz/
 
 # OpenAPI generator
 **/meilisearch-openapi.json
+planning/
