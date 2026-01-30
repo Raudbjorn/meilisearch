@@ -19,18 +19,17 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use async_openai::reqwest_eventsource::{Event, EventSource, RequestBuilderExt};
 use async_openai::types::{
     ChatChoice, ChatChoiceStream, ChatCompletionMessageToolCall,
     ChatCompletionMessageToolCallChunk, ChatCompletionRequestAssistantMessage,
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
-    ChatCompletionResponseMessage, ChatCompletionStreamResponseDelta,
-    ChatCompletionTool, ChatCompletionToolType, CompletionUsage,
-    CreateChatCompletionRequest, CreateChatCompletionResponse,
-    CreateChatCompletionStreamResponse, FinishReason, FunctionCall, FunctionCallStream,
-    Role,
+    ChatCompletionResponseMessage, ChatCompletionStreamResponseDelta, ChatCompletionTool,
+    ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
+    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
+    FunctionCallStream, Role,
 };
-use async_openai::reqwest_eventsource::{Event, EventSource, RequestBuilderExt};
 use futures::Stream;
 use http_client::reqwest::header::CONTENT_TYPE;
 use meilisearch_types::error::{Code, ErrorCode};
@@ -106,10 +105,8 @@ impl AnthropicConfig {
             .or_else(|| settings.source.base_url().map(String::from))
             .unwrap_or_else(|| Self::DEFAULT_BASE_URL.to_string());
 
-        let anthropic_version = settings
-            .api_version
-            .clone()
-            .unwrap_or_else(|| Self::DEFAULT_VERSION.to_string());
+        let anthropic_version =
+            settings.api_version.clone().unwrap_or_else(|| Self::DEFAULT_VERSION.to_string());
 
         Ok(Self { api_key, base_url, anthropic_version })
     }
@@ -189,11 +186,7 @@ pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "tool_use")]
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
+    ToolUse { id: String, name: String, input: serde_json::Value },
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
@@ -231,7 +224,7 @@ pub struct AnthropicUsage {
 }
 
 /// Anthropic error response.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AnthropicError {
     #[serde(rename = "type")]
     pub error_type: String,
@@ -254,19 +247,13 @@ pub enum AnthropicStreamEvent {
     #[serde(rename = "message_start")]
     MessageStart { message: MessageStartData },
     #[serde(rename = "content_block_start")]
-    ContentBlockStart {
-        index: u32,
-        content_block: ContentBlockStartData,
-    },
+    ContentBlockStart { index: u32, content_block: ContentBlockStartData },
     #[serde(rename = "content_block_delta")]
     ContentBlockDelta { index: u32, delta: ContentDelta },
     #[serde(rename = "content_block_stop")]
     ContentBlockStop { index: u32 },
     #[serde(rename = "message_delta")]
-    MessageDelta {
-        delta: MessageDeltaData,
-        usage: Option<AnthropicUsage>,
-    },
+    MessageDelta { delta: MessageDeltaData, usage: Option<AnthropicUsage> },
     #[serde(rename = "message_stop")]
     MessageStop,
     #[serde(rename = "ping")]
@@ -373,25 +360,17 @@ pub fn convert_request_to_anthropic(request: &CreateChatCompletionRequest) -> An
             }
             ChatCompletionRequestMessage::User(user) => {
                 let content = extract_user_content(user);
-                anthropic_messages.push(AnthropicMessage {
-                    role: "user".to_string(),
-                    content,
-                });
+                anthropic_messages.push(AnthropicMessage { role: "user".to_string(), content });
             }
             ChatCompletionRequestMessage::Assistant(assistant) => {
                 let content = extract_assistant_content(assistant);
-                anthropic_messages.push(AnthropicMessage {
-                    role: "assistant".to_string(),
-                    content,
-                });
+                anthropic_messages
+                    .push(AnthropicMessage { role: "assistant".to_string(), content });
             }
             ChatCompletionRequestMessage::Tool(tool) => {
                 // Tool results go in user messages with tool_result content blocks
                 let content = extract_tool_result_content(tool);
-                anthropic_messages.push(AnthropicMessage {
-                    role: "user".to_string(),
-                    content,
-                });
+                anthropic_messages.push(AnthropicMessage { role: "user".to_string(), content });
             }
             ChatCompletionRequestMessage::Developer(dev) => {
                 // Developer messages are treated as system in Anthropic
@@ -399,12 +378,9 @@ pub fn convert_request_to_anthropic(request: &CreateChatCompletionRequest) -> An
                     async_openai::types::ChatCompletionRequestDeveloperMessageContent::Text(t) => {
                         t.clone()
                     }
-                    async_openai::types::ChatCompletionRequestDeveloperMessageContent::Array(arr) => {
-                        arr.iter()
-                            .map(|p| p.text.clone())
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    }
+                    async_openai::types::ChatCompletionRequestDeveloperMessageContent::Array(
+                        arr,
+                    ) => arr.iter().map(|p| p.text.clone()).collect::<Vec<_>>().join("\n"),
                 };
                 if !text.is_empty() {
                     system_contents.push(text);
@@ -426,12 +402,8 @@ pub fn convert_request_to_anthropic(request: &CreateChatCompletionRequest) -> An
     };
 
     // Convert tools
-    let tools = request.tools.as_ref().map(|tools| {
-        tools
-            .iter()
-            .map(convert_tool_to_anthropic)
-            .collect()
-    });
+    let tools =
+        request.tools.as_ref().map(|tools| tools.iter().map(convert_tool_to_anthropic).collect());
 
     // Convert tool_choice if present
     let tool_choice = request.tool_choice.as_ref().map(|tc| match tc {
@@ -453,9 +425,7 @@ pub fn convert_request_to_anthropic(request: &CreateChatCompletionRequest) -> An
     });
 
     // Determine max_tokens based on model
-    let max_tokens = request.max_tokens.unwrap_or_else(|| {
-        get_default_max_tokens(&request.model)
-    });
+    let max_tokens = request.max_tokens.unwrap_or_else(|| get_default_max_tokens(&request.model));
 
     AnthropicRequest {
         model: request.model.clone(),
@@ -478,18 +448,16 @@ pub fn convert_request_to_anthropic(request: &CreateChatCompletionRequest) -> An
 fn extract_system_content(sys: &ChatCompletionRequestSystemMessage) -> String {
     match &sys.content {
         async_openai::types::ChatCompletionRequestSystemMessageContent::Text(text) => text.clone(),
-        async_openai::types::ChatCompletionRequestSystemMessageContent::Array(parts) => {
-            parts
-                .iter()
-                .map(|p| {
-                    let async_openai::types::ChatCompletionRequestSystemMessageContentPart::Text(
-                        text_part,
-                    ) = p;
-                    text_part.text.clone()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
+        async_openai::types::ChatCompletionRequestSystemMessageContent::Array(parts) => parts
+            .iter()
+            .map(|p| {
+                let async_openai::types::ChatCompletionRequestSystemMessageContentPart::Text(
+                    text_part,
+                ) = p;
+                text_part.text.clone()
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 
@@ -504,9 +472,7 @@ fn extract_user_content(user: &ChatCompletionRequestUserMessage) -> AnthropicCon
                 .filter_map(|p| match p {
                     async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(
                         text_part,
-                    ) => Some(ContentBlock::Text {
-                        text: text_part.text.clone(),
-                    }),
+                    ) => Some(ContentBlock::Text { text: text_part.text.clone() }),
                     async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(
                         _img,
                     ) => {
@@ -527,7 +493,9 @@ fn extract_user_content(user: &ChatCompletionRequestUserMessage) -> AnthropicCon
     }
 }
 
-fn extract_assistant_content(assistant: &ChatCompletionRequestAssistantMessage) -> AnthropicContent {
+fn extract_assistant_content(
+    assistant: &ChatCompletionRequestAssistantMessage,
+) -> AnthropicContent {
     // Check for tool calls first
     if let Some(tool_calls) = &assistant.tool_calls {
         let blocks: Vec<ContentBlock> = tool_calls
@@ -611,17 +579,16 @@ fn extract_assistant_content(assistant: &ChatCompletionRequestAssistantMessage) 
 fn extract_tool_result_content(tool: &ChatCompletionRequestToolMessage) -> AnthropicContent {
     let content_str = match &tool.content {
         async_openai::types::ChatCompletionRequestToolMessageContent::Text(text) => text.clone(),
-        async_openai::types::ChatCompletionRequestToolMessageContent::Array(arr) => {
-            arr.iter()
-                .map(|p| {
-                    let async_openai::types::ChatCompletionRequestToolMessageContentPart::Text(
-                        text_part,
-                    ) = p;
-                    text_part.text.clone()
-                })
-                .collect::<Vec<_>>()
-                .join("")
-        }
+        async_openai::types::ChatCompletionRequestToolMessageContent::Array(arr) => arr
+            .iter()
+            .map(|p| {
+                let async_openai::types::ChatCompletionRequestToolMessageContentPart::Text(
+                    text_part,
+                ) = p;
+                text_part.text.clone()
+            })
+            .collect::<Vec<_>>()
+            .join(""),
     };
 
     AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
@@ -658,7 +625,7 @@ fn get_default_max_tokens(model: &str) -> u32 {
     {
         // Claude 4.5 series can output up to 64K tokens; 32K is a conservative default
         32000
-    } else if model.contains("claude-opus-4") || model.contains("claude-opus-4-1") {
+    } else if model.contains("claude-opus-4") {
         // Claude Opus 4.x can output up to 32K tokens; 16K is a conservative default
         16000
     } else if model.contains("claude-sonnet-4") || model.contains("claude-3-7-sonnet") {
@@ -684,9 +651,7 @@ fn get_default_max_tokens(model: &str) -> u32 {
 // ============================================================================
 
 /// Convert Anthropic response to OpenAI format.
-pub fn convert_response_to_openai(
-    response: AnthropicResponse,
-) -> CreateChatCompletionResponse {
+pub fn convert_response_to_openai(response: AnthropicResponse) -> CreateChatCompletionResponse {
     // Extract text content and tool calls
     let mut text_content = String::new();
     let mut tool_calls: Vec<ChatCompletionMessageToolCall> = Vec::new();
@@ -722,16 +687,8 @@ pub fn convert_response_to_openai(
     // Build the response message
     let message = ChatCompletionResponseMessage {
         role: Role::Assistant,
-        content: if text_content.is_empty() {
-            None
-        } else {
-            Some(text_content)
-        },
-        tool_calls: if tool_calls.is_empty() {
-            None
-        } else {
-            Some(tool_calls)
-        },
+        content: if text_content.is_empty() { None } else { Some(text_content) },
+        tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
         function_call: None,
         refusal: None,
         audio: None,
@@ -751,12 +708,7 @@ pub fn convert_response_to_openai(
         object: "chat.completion".to_string(),
         created: OffsetDateTime::now_utc().unix_timestamp() as u32,
         model: response.model,
-        choices: vec![ChatChoice {
-            index: 0,
-            message,
-            finish_reason,
-            logprobs: None,
-        }],
+        choices: vec![ChatChoice { index: 0, message, finish_reason, logprobs: None }],
         usage,
         system_fingerprint: None,
         service_tier: None,
@@ -769,11 +721,12 @@ pub fn convert_response_to_openai(
 
 /// Convert a single Anthropic SSE event to OpenAI streaming format.
 ///
-/// Returns None if the event should be skipped (e.g., ping events).
+/// Returns Ok(None) if the event should be skipped (e.g., ping events).
+/// Returns Err if the event represents an error that should terminate the stream.
 fn convert_sse_event_to_openai(
     event: &AnthropicStreamEvent,
     state: &mut StreamState,
-) -> Option<CreateChatCompletionStreamResponse> {
+) -> Result<Option<CreateChatCompletionStreamResponse>, AnthropicClientError> {
     match event {
         AnthropicStreamEvent::MessageStart { message } => {
             // Reset tool call index for new message
@@ -783,7 +736,7 @@ fn convert_sse_event_to_openai(
             state.created = OffsetDateTime::now_utc().unix_timestamp();
 
             // Send initial chunk with role
-            Some(create_stream_chunk(
+            Ok(Some(create_stream_chunk(
                 &state.message_id,
                 &state.model,
                 state.created,
@@ -796,13 +749,10 @@ fn convert_sse_event_to_openai(
                 },
                 None,
                 None,
-            ))
+            )))
         }
 
-        AnthropicStreamEvent::ContentBlockStart {
-            index,
-            content_block,
-        } => {
+        AnthropicStreamEvent::ContentBlockStart { index, content_block } => {
             match content_block {
                 ContentBlockStartData::ToolUse { id, name } => {
                     // Track this tool use block
@@ -810,15 +760,11 @@ fn convert_sse_event_to_openai(
                     state.tool_call_index += 1;
                     state.tool_state.insert(
                         *index,
-                        ToolInfo {
-                            id: id.clone(),
-                            name: name.clone(),
-                            openai_index,
-                        },
+                        ToolInfo { id: id.clone(), name: name.clone(), openai_index },
                     );
 
                     // Send initial tool call chunk
-                    Some(create_stream_chunk(
+                    Ok(Some(create_stream_chunk(
                         &state.message_id,
                         &state.model,
                         state.created,
@@ -839,37 +785,35 @@ fn convert_sse_event_to_openai(
                         },
                         None,
                         None,
-                    ))
+                    )))
                 }
                 ContentBlockStartData::Text => {
                     // Text blocks don't need a start event in OpenAI format
-                    None
+                    Ok(None)
                 }
             }
         }
 
         AnthropicStreamEvent::ContentBlockDelta { index, delta } => {
             match delta {
-                ContentDelta::TextDelta { text } => {
-                    Some(create_stream_chunk(
-                        &state.message_id,
-                        &state.model,
-                        state.created,
-                        ChatCompletionStreamResponseDelta {
-                            role: None,
-                            content: Some(text.clone()),
-                            tool_calls: None,
-                            function_call: None,
-                            refusal: None,
-                        },
-                        None,
-                        None,
-                    ))
-                }
+                ContentDelta::TextDelta { text } => Ok(Some(create_stream_chunk(
+                    &state.message_id,
+                    &state.model,
+                    state.created,
+                    ChatCompletionStreamResponseDelta {
+                        role: None,
+                        content: Some(text.clone()),
+                        tool_calls: None,
+                        function_call: None,
+                        refusal: None,
+                    },
+                    None,
+                    None,
+                ))),
                 ContentDelta::InputJsonDelta { partial_json } => {
                     // Look up the tool info for this content block
                     if let Some(tool_info) = state.tool_state.get(index) {
-                        Some(create_stream_chunk(
+                        Ok(Some(create_stream_chunk(
                             &state.message_id,
                             &state.model,
                             state.created,
@@ -890,9 +834,9 @@ fn convert_sse_event_to_openai(
                             },
                             None,
                             None,
-                        ))
+                        )))
                     } else {
-                        None
+                        Ok(None)
                     }
                 }
             }
@@ -901,7 +845,7 @@ fn convert_sse_event_to_openai(
         AnthropicStreamEvent::ContentBlockStop { index } => {
             // Clear tool state for the completed block
             state.tool_state.remove(index);
-            None
+            Ok(None)
         }
 
         AnthropicStreamEvent::MessageDelta { delta, usage } => {
@@ -926,7 +870,7 @@ fn convert_sse_event_to_openai(
             });
 
             if finish_reason.is_some() {
-                Some(create_stream_chunk(
+                Ok(Some(create_stream_chunk(
                     &state.message_id,
                     &state.model,
                     state.created,
@@ -939,26 +883,25 @@ fn convert_sse_event_to_openai(
                     },
                     finish_reason,
                     state.usage.clone(),
-                ))
+                )))
             } else {
-                None
+                Ok(None)
             }
         }
 
         AnthropicStreamEvent::MessageStop => {
             // Final chunk - OpenAI expects [DONE] which is handled by the stream
-            None
+            Ok(None)
         }
 
         AnthropicStreamEvent::Ping => {
             // Skip ping events
-            None
+            Ok(None)
         }
 
         AnthropicStreamEvent::Error { error } => {
-            // Log error but don't convert to a chunk
-            tracing::error!("Anthropic stream error: {} - {}", error.error_type, error.message);
-            None
+            // Propagate error to stream consumer
+            Err(AnthropicClientError::from_anthropic_error(error.clone()))
         }
     }
 }
@@ -976,12 +919,7 @@ fn create_stream_chunk(
         object: "chat.completion.chunk".to_string(),
         created: created as u32,
         model: model.to_string(),
-        choices: vec![ChatChoiceStream {
-            index: 0,
-            delta,
-            finish_reason,
-            logprobs: None,
-        }],
+        choices: vec![ChatChoiceStream { index: 0, delta, finish_reason, logprobs: None }],
         usage,
         system_fingerprint: None,
         service_tier: None,
@@ -1117,8 +1055,7 @@ impl AnthropicClientError {
             }
             _ => {
                 // For other errors, include the message but ensure no API key patterns are present
-                if message.to_lowercase().contains("api")
-                    && message.to_lowercase().contains("key")
+                if message.to_lowercase().contains("api") && message.to_lowercase().contains("key")
                 {
                     "An error occurred with the Anthropic API. Please check your configuration."
                         .to_string()
@@ -1180,11 +1117,9 @@ impl AnthropicClientError {
                 Some("internal".to_string()),
                 "Failed to parse response from Anthropic API".to_string(),
             ),
-            Self::Stream(msg) => (
-                "stream_error".to_string(),
-                Some("internal".to_string()),
-                msg.clone(),
-            ),
+            Self::Stream(msg) => {
+                ("stream_error".to_string(), Some("internal".to_string()), msg.clone())
+            }
         };
 
         StreamErrorEvent {
@@ -1221,7 +1156,9 @@ impl ErrorCode for AnthropicClientError {
             | Self::Api { error_type: AnthropicErrorType::RequestTooLarge, .. } => Code::BadRequest,
 
             // All other errors map to internal
-            Self::Api { .. } | Self::Request(_) | Self::Parse(_) | Self::Stream(_) => Code::Internal,
+            Self::Api { .. } | Self::Request(_) | Self::Parse(_) | Self::Stream(_) => {
+                Code::Internal
+            }
         }
     }
 }
@@ -1241,10 +1178,7 @@ impl AnthropicClient {
         let http_client = http_client::reqwest::Client::builder()
             .build_with_policies(ip_policy, http_client::reqwest::redirect::Policy::default())
             .expect("Failed to build HTTP client");
-        Self {
-            config,
-            http_client,
-        }
+        Self { config, http_client }
     }
 
     /// Create a streaming chat completion, returning OpenAI-compatible stream events.
@@ -1263,15 +1197,12 @@ impl AnthropicClient {
         let api_key = self.config.api_key.clone();
         let anthropic_version = self.config.anthropic_version.clone();
 
-        let request_builder = self
-            .http_client
-            .post(&url)
-            .prepare(move |rb| {
-                rb.header("x-api-key", api_key)
-                    .header("anthropic-version", anthropic_version)
-                    .header(CONTENT_TYPE, "application/json")
-                    .json(&anthropic_request)
-            });
+        let request_builder = self.http_client.post(&url).prepare(move |rb| {
+            rb.header("x-api-key", api_key)
+                .header("anthropic-version", anthropic_version)
+                .header(CONTENT_TYPE, "application/json")
+                .json(&anthropic_request)
+        });
 
         let event_source = request_builder
             .eventsource()
@@ -1279,11 +1210,7 @@ impl AnthropicClient {
 
         let state = Arc::new(Mutex::new(StreamState::new()));
 
-        Ok(AnthropicStream {
-            event_source,
-            state,
-            pending_event: None,
-        })
+        Ok(AnthropicStream { event_source, state, pending_event: None })
     }
 
     /// Create a non-streaming chat completion.
@@ -1346,18 +1273,15 @@ impl Stream for AnthropicStream {
             if let Some(pending) = self.pending_event.take() {
                 match state_arc.try_lock() {
                     Ok(mut state) => {
-                        if let Some(openai_chunk) =
-                            convert_sse_event_to_openai(&pending, &mut state)
-                        {
-                            return Poll::Ready(Some(Ok(openai_chunk)));
+                        match convert_sse_event_to_openai(&pending, &mut state) {
+                            Ok(Some(chunk)) => return Poll::Ready(Some(Ok(chunk))),
+                            Ok(None) => { /* Event processed but no output, continue */ }
+                            Err(e) => return Poll::Ready(Some(Err(e))),
                         }
-                        // Event was processed but didn't produce output, continue to next
                     }
                     Err(_) => {
                         // Lock still contended, put the event back and return Pending
-                        tracing::warn!(
-                            "Stream state lock contended, buffering event for retry"
-                        );
+                        tracing::warn!("Stream state lock contended, buffering event for retry");
                         self.pending_event = Some(pending);
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
@@ -1387,12 +1311,14 @@ impl Stream for AnthropicStream {
                             // Convert to OpenAI format
                             match state_arc.try_lock() {
                                 Ok(mut state) => {
-                                    if let Some(openai_chunk) =
-                                        convert_sse_event_to_openai(&anthropic_event, &mut state)
+                                    match convert_sse_event_to_openai(&anthropic_event, &mut state)
                                     {
-                                        return Poll::Ready(Some(Ok(openai_chunk)));
+                                        Ok(Some(chunk)) => {
+                                            return Poll::Ready(Some(Ok(chunk)));
+                                        }
+                                        Ok(None) => { /* Event processed but no output, continue */ }
+                                        Err(e) => return Poll::Ready(Some(Err(e))),
                                     }
-                                    // Event processed but no output, continue
                                 }
                                 Err(_) => {
                                     // Lock contended, buffer the event for next poll
@@ -1478,13 +1404,11 @@ mod tests {
         state.model = "claude-sonnet-4".to_string();
 
         let event = AnthropicStreamEvent::MessageDelta {
-            delta: MessageDeltaData {
-                stop_reason: Some("tool_use".to_string()),
-            },
+            delta: MessageDeltaData { stop_reason: Some("tool_use".to_string()) },
             usage: None,
         };
 
-        let chunk = convert_sse_event_to_openai(&event, &mut state);
+        let chunk = convert_sse_event_to_openai(&event, &mut state).unwrap();
         assert!(chunk.is_some());
 
         let chunk = chunk.unwrap();
@@ -1506,7 +1430,7 @@ mod tests {
             },
         };
 
-        let chunk = convert_sse_event_to_openai(&event, &mut state);
+        let chunk = convert_sse_event_to_openai(&event, &mut state).unwrap();
         assert!(chunk.is_some());
 
         // Verify state was updated
@@ -1530,10 +1454,7 @@ mod tests {
                 text: "Hello! How can I help you today?".to_string(),
             }],
             stop_reason: Some("end_turn".to_string()),
-            usage: Some(AnthropicUsage {
-                input_tokens: 10,
-                output_tokens: 25,
-            }),
+            usage: Some(AnthropicUsage { input_tokens: 10, output_tokens: 25 }),
         };
 
         let openai_response = convert_response_to_openai(anthropic_response);
@@ -1552,10 +1473,7 @@ mod tests {
         assert_eq!(openai_response.choices.len(), 1);
         let choice = &openai_response.choices[0];
         assert_eq!(choice.index, 0);
-        assert_eq!(
-            choice.message.content.as_deref(),
-            Some("Hello! How can I help you today?")
-        );
+        assert_eq!(choice.message.content.as_deref(), Some("Hello! How can I help you today?"));
         assert_eq!(choice.message.role, Role::Assistant);
         assert!(choice.message.tool_calls.is_none());
         assert_eq!(choice.finish_reason, Some(FinishReason::Stop));
@@ -1577,26 +1495,16 @@ mod tests {
                 input: serde_json::json!({"q": "search query", "index_uid": "movies"}),
             }],
             stop_reason: Some("tool_use".to_string()),
-            usage: Some(AnthropicUsage {
-                input_tokens: 50,
-                output_tokens: 100,
-            }),
+            usage: Some(AnthropicUsage { input_tokens: 50, output_tokens: 100 }),
         };
 
         let openai_response_tools = convert_response_to_openai(anthropic_response_with_tools);
 
         // Verify tool_use stop_reason maps to ToolCalls
-        assert_eq!(
-            openai_response_tools.choices[0].finish_reason,
-            Some(FinishReason::ToolCalls)
-        );
+        assert_eq!(openai_response_tools.choices[0].finish_reason, Some(FinishReason::ToolCalls));
 
         // Verify tool calls
-        let tool_calls = openai_response_tools.choices[0]
-            .message
-            .tool_calls
-            .as_ref()
-            .unwrap();
+        let tool_calls = openai_response_tools.choices[0].message.tool_calls.as_ref().unwrap();
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "toolu_01A");
         assert_eq!(tool_calls[0].function.name, "_meiliSearchInIndex");
@@ -1607,36 +1515,26 @@ mod tests {
             id: "msg_03DEF".to_string(),
             response_type: "message".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
-            content: vec![ContentBlock::Text {
-                text: "Truncated response...".to_string(),
-            }],
+            content: vec![ContentBlock::Text { text: "Truncated response...".to_string() }],
             stop_reason: Some("max_tokens".to_string()),
             usage: None,
         };
 
         let openai_response_length = convert_response_to_openai(anthropic_response_max_tokens);
-        assert_eq!(
-            openai_response_length.choices[0].finish_reason,
-            Some(FinishReason::Length)
-        );
+        assert_eq!(openai_response_length.choices[0].finish_reason, Some(FinishReason::Length));
 
         // Test stop_sequence stop_reason
         let anthropic_response_stop_seq = AnthropicResponse {
             id: "msg_04GHI".to_string(),
             response_type: "message".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
-            content: vec![ContentBlock::Text {
-                text: "Stopped at sequence".to_string(),
-            }],
+            content: vec![ContentBlock::Text { text: "Stopped at sequence".to_string() }],
             stop_reason: Some("stop_sequence".to_string()),
             usage: None,
         };
 
         let openai_response_stop_seq = convert_response_to_openai(anthropic_response_stop_seq);
-        assert_eq!(
-            openai_response_stop_seq.choices[0].finish_reason,
-            Some(FinishReason::Stop)
-        );
+        assert_eq!(openai_response_stop_seq.choices[0].finish_reason, Some(FinishReason::Stop));
     }
 
     #[test]
@@ -1708,10 +1606,7 @@ mod tests {
             AnthropicErrorType::from_error_type("rate_limit_error"),
             AnthropicErrorType::RateLimit
         );
-        assert_eq!(
-            AnthropicErrorType::from_error_type("api_error"),
-            AnthropicErrorType::ApiError
-        );
+        assert_eq!(AnthropicErrorType::from_error_type("api_error"), AnthropicErrorType::ApiError);
         assert_eq!(
             AnthropicErrorType::from_error_type("overloaded_error"),
             AnthropicErrorType::Overloaded
@@ -1745,10 +1640,7 @@ mod tests {
         assert_eq!(error.error_code(), Code::InvalidChatCompletionApiKey);
         assert!(matches!(
             error,
-            AnthropicClientError::Api {
-                error_type: AnthropicErrorType::Authentication,
-                ..
-            }
+            AnthropicClientError::Api { error_type: AnthropicErrorType::Authentication, .. }
         ));
     }
 
@@ -1772,10 +1664,7 @@ mod tests {
         assert_eq!(error.error_code(), Code::TooManySearchRequests);
         assert!(matches!(
             error,
-            AnthropicClientError::Api {
-                error_type: AnthropicErrorType::RateLimit,
-                ..
-            }
+            AnthropicClientError::Api { error_type: AnthropicErrorType::RateLimit, .. }
         ));
     }
 
@@ -1789,10 +1678,7 @@ mod tests {
         assert_eq!(error.error_code(), Code::TooManySearchRequests);
         assert!(matches!(
             error,
-            AnthropicClientError::Api {
-                error_type: AnthropicErrorType::Overloaded,
-                ..
-            }
+            AnthropicClientError::Api { error_type: AnthropicErrorType::Overloaded, .. }
         ));
     }
 
@@ -2225,14 +2111,12 @@ mod tests {
 
         let request = CreateChatCompletionRequest {
             model: "claude-sonnet-4-20250514".to_string(),
-            messages: vec![ChatCompletionRequestMessage::User(
-                ChatCompletionRequestUserMessage {
-                    content: async_openai::types::ChatCompletionRequestUserMessageContent::Text(
-                        "Hello".to_string(),
-                    ),
-                    name: None,
-                },
-            )],
+            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: async_openai::types::ChatCompletionRequestUserMessageContent::Text(
+                    "Hello".to_string(),
+                ),
+                name: None,
+            })],
             tools: Some(vec![ChatCompletionTool {
                 r#type: ChatCompletionToolType::Function,
                 function: FunctionObject {
@@ -2272,14 +2156,12 @@ mod tests {
     fn test_convert_stop_sequences() {
         let request = CreateChatCompletionRequest {
             model: "claude-sonnet-4-20250514".to_string(),
-            messages: vec![ChatCompletionRequestMessage::User(
-                ChatCompletionRequestUserMessage {
-                    content: async_openai::types::ChatCompletionRequestUserMessageContent::Text(
-                        "Hello".to_string(),
-                    ),
-                    name: None,
-                },
-            )],
+            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: async_openai::types::ChatCompletionRequestUserMessageContent::Text(
+                    "Hello".to_string(),
+                ),
+                name: None,
+            })],
             stop: Some(async_openai::types::Stop::StringArray(vec![
                 "STOP".to_string(),
                 "END".to_string(),
@@ -2300,14 +2182,12 @@ mod tests {
     fn test_convert_temperature_and_top_p() {
         let request = CreateChatCompletionRequest {
             model: "claude-sonnet-4-20250514".to_string(),
-            messages: vec![ChatCompletionRequestMessage::User(
-                ChatCompletionRequestUserMessage {
-                    content: async_openai::types::ChatCompletionRequestUserMessageContent::Text(
-                        "Hello".to_string(),
-                    ),
-                    name: None,
-                },
-            )],
+            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: async_openai::types::ChatCompletionRequestUserMessageContent::Text(
+                    "Hello".to_string(),
+                ),
+                name: None,
+            })],
             temperature: Some(0.7),
             top_p: Some(0.9),
             ..Default::default()
@@ -2323,14 +2203,12 @@ mod tests {
     fn test_max_tokens_default_when_not_specified() {
         let request = CreateChatCompletionRequest {
             model: "claude-3-opus-20240229".to_string(),
-            messages: vec![ChatCompletionRequestMessage::User(
-                ChatCompletionRequestUserMessage {
-                    content: async_openai::types::ChatCompletionRequestUserMessageContent::Text(
-                        "Hello".to_string(),
-                    ),
-                    name: None,
-                },
-            )],
+            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: async_openai::types::ChatCompletionRequestUserMessageContent::Text(
+                    "Hello".to_string(),
+                ),
+                name: None,
+            })],
             max_tokens: None, // Not specified
             ..Default::default()
         };
@@ -2345,14 +2223,12 @@ mod tests {
     fn test_max_tokens_preserved_when_specified() {
         let request = CreateChatCompletionRequest {
             model: "claude-3-opus-20240229".to_string(),
-            messages: vec![ChatCompletionRequestMessage::User(
-                ChatCompletionRequestUserMessage {
-                    content: async_openai::types::ChatCompletionRequestUserMessageContent::Text(
-                        "Hello".to_string(),
-                    ),
-                    name: None,
-                },
-            )],
+            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: async_openai::types::ChatCompletionRequestUserMessageContent::Text(
+                    "Hello".to_string(),
+                ),
+                name: None,
+            })],
             max_tokens: Some(1000),
             ..Default::default()
         };
@@ -2365,30 +2241,27 @@ mod tests {
     #[test]
     fn test_convert_user_message_with_array_content() {
         use async_openai::types::{
-            ChatCompletionRequestMessageContentPartText, ChatCompletionRequestUserMessageContentPart,
+            ChatCompletionRequestMessageContentPartText,
+            ChatCompletionRequestUserMessageContentPart,
         };
 
         let request = CreateChatCompletionRequest {
             model: "claude-sonnet-4-20250514".to_string(),
-            messages: vec![ChatCompletionRequestMessage::User(
-                ChatCompletionRequestUserMessage {
-                    content: async_openai::types::ChatCompletionRequestUserMessageContent::Array(
-                        vec![
-                            ChatCompletionRequestUserMessageContentPart::Text(
-                                ChatCompletionRequestMessageContentPartText {
-                                    text: "First part. ".to_string(),
-                                },
-                            ),
-                            ChatCompletionRequestUserMessageContentPart::Text(
-                                ChatCompletionRequestMessageContentPartText {
-                                    text: "Second part.".to_string(),
-                                },
-                            ),
-                        ],
+            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: async_openai::types::ChatCompletionRequestUserMessageContent::Array(vec![
+                    ChatCompletionRequestUserMessageContentPart::Text(
+                        ChatCompletionRequestMessageContentPartText {
+                            text: "First part. ".to_string(),
+                        },
                     ),
-                    name: None,
-                },
-            )],
+                    ChatCompletionRequestUserMessageContentPart::Text(
+                        ChatCompletionRequestMessageContentPartText {
+                            text: "Second part.".to_string(),
+                        },
+                    ),
+                ]),
+                name: None,
+            })],
             ..Default::default()
         };
 
@@ -2404,5 +2277,630 @@ mod tests {
                 // Single text is also acceptable if implementation simplifies
             }
         }
+    }
+
+    // ============================================================================
+    // Integration Tests: Full Request/Response Pipeline
+    // ============================================================================
+    //
+    // These tests verify the complete conversion pipeline from OpenAI request
+    // format through Anthropic request/response format and back to OpenAI format.
+
+    /// Test a complete basic chat flow: OpenAI request -> Anthropic request -> Anthropic response -> OpenAI response
+    #[test]
+    fn test_anthropic_basic_chat_pipeline() {
+        // 1. Create an OpenAI-style request
+        let openai_request = CreateChatCompletionRequest {
+            model: "claude-sonnet-4-20250514".to_string(),
+            messages: vec![
+                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                    content: async_openai::types::ChatCompletionRequestSystemMessageContent::Text(
+                        "You are a helpful assistant.".to_string(),
+                    ),
+                    name: None,
+                }),
+                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: async_openai::types::ChatCompletionRequestUserMessageContent::Text(
+                        "What is the capital of France?".to_string(),
+                    ),
+                    name: None,
+                }),
+            ],
+            temperature: Some(0.7),
+            max_tokens: Some(100),
+            ..Default::default()
+        };
+
+        // 2. Convert to Anthropic format
+        let anthropic_request = convert_request_to_anthropic(&openai_request);
+
+        // 3. Verify Anthropic request structure
+        assert_eq!(anthropic_request.model, "claude-sonnet-4-20250514");
+        assert_eq!(anthropic_request.max_tokens, 100);
+        assert_eq!(anthropic_request.temperature, Some(0.7));
+        assert!(matches!(
+            anthropic_request.system,
+            Some(AnthropicSystem::Text(ref s)) if s == "You are a helpful assistant."
+        ));
+        assert_eq!(anthropic_request.messages.len(), 1);
+        assert_eq!(anthropic_request.messages[0].role, "user");
+
+        // 4. Simulate Anthropic response
+        let anthropic_response = AnthropicResponse {
+            id: "msg_01XYZ123".to_string(),
+            response_type: "message".to_string(),
+            model: "claude-sonnet-4-20250514".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "The capital of France is Paris.".to_string(),
+            }],
+            stop_reason: Some("end_turn".to_string()),
+            usage: Some(AnthropicUsage { input_tokens: 25, output_tokens: 10 }),
+        };
+
+        // 5. Convert back to OpenAI format
+        let openai_response = convert_response_to_openai(anthropic_response);
+
+        // 6. Verify OpenAI response structure
+        assert!(openai_response.id.starts_with("chatcmpl-"));
+        assert_eq!(openai_response.object, "chat.completion");
+        assert_eq!(openai_response.model, "claude-sonnet-4-20250514");
+        assert_eq!(openai_response.choices.len(), 1);
+
+        let choice = &openai_response.choices[0];
+        assert_eq!(choice.index, 0);
+        assert_eq!(choice.message.role, Role::Assistant);
+        assert_eq!(choice.message.content.as_deref(), Some("The capital of France is Paris."));
+        assert_eq!(choice.finish_reason, Some(FinishReason::Stop));
+
+        let usage = openai_response.usage.as_ref().unwrap();
+        assert_eq!(usage.prompt_tokens, 25);
+        assert_eq!(usage.completion_tokens, 10);
+        assert_eq!(usage.total_tokens, 35);
+    }
+
+    /// Test streaming event sequence: message_start -> content_block_start -> content_block_delta -> message_delta -> message_stop
+    #[test]
+    fn test_anthropic_streaming_event_sequence() {
+        let mut state = StreamState::new();
+
+        // 1. message_start - should emit chunk with role
+        let event1 = AnthropicStreamEvent::MessageStart {
+            message: MessageStartData {
+                id: "msg_stream_123".to_string(),
+                model: "claude-sonnet-4-20250514".to_string(),
+                usage: None,
+            },
+        };
+        let chunk1 = convert_sse_event_to_openai(&event1, &mut state).unwrap();
+        assert!(chunk1.is_some());
+        let chunk1 = chunk1.unwrap();
+        assert_eq!(chunk1.id, "msg_stream_123");
+        assert_eq!(chunk1.model, "claude-sonnet-4-20250514");
+        assert_eq!(chunk1.choices[0].delta.role, Some(Role::Assistant));
+        assert!(chunk1.choices[0].delta.content.is_none());
+        assert!(chunk1.choices[0].finish_reason.is_none());
+
+        // 2. content_block_start (text) - should be skipped
+        let event2 = AnthropicStreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlockStartData::Text,
+        };
+        let chunk2 = convert_sse_event_to_openai(&event2, &mut state).unwrap();
+        assert!(chunk2.is_none());
+
+        // 3. content_block_delta (text) - should emit content
+        let event3 = AnthropicStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentDelta::TextDelta { text: "Hello, ".to_string() },
+        };
+        let chunk3 = convert_sse_event_to_openai(&event3, &mut state).unwrap();
+        assert!(chunk3.is_some());
+        let chunk3 = chunk3.unwrap();
+        assert_eq!(chunk3.choices[0].delta.content, Some("Hello, ".to_string()));
+        assert!(chunk3.choices[0].finish_reason.is_none());
+
+        // 4. Another text delta
+        let event4 = AnthropicStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentDelta::TextDelta { text: "world!".to_string() },
+        };
+        let chunk4 = convert_sse_event_to_openai(&event4, &mut state).unwrap();
+        assert!(chunk4.is_some());
+        let chunk4 = chunk4.unwrap();
+        assert_eq!(chunk4.choices[0].delta.content, Some("world!".to_string()));
+
+        // 5. content_block_stop - should be skipped
+        let event5 = AnthropicStreamEvent::ContentBlockStop { index: 0 };
+        let chunk5 = convert_sse_event_to_openai(&event5, &mut state).unwrap();
+        assert!(chunk5.is_none());
+
+        // 6. message_delta with stop_reason - should emit finish_reason
+        let event6 = AnthropicStreamEvent::MessageDelta {
+            delta: MessageDeltaData { stop_reason: Some("end_turn".to_string()) },
+            usage: Some(AnthropicUsage { input_tokens: 10, output_tokens: 5 }),
+        };
+        let chunk6 = convert_sse_event_to_openai(&event6, &mut state).unwrap();
+        assert!(chunk6.is_some());
+        let chunk6 = chunk6.unwrap();
+        assert_eq!(chunk6.choices[0].finish_reason, Some(FinishReason::Stop));
+
+        // 7. message_stop - should be skipped
+        let event7 = AnthropicStreamEvent::MessageStop;
+        let chunk7 = convert_sse_event_to_openai(&event7, &mut state).unwrap();
+        assert!(chunk7.is_none());
+
+        // 8. ping - should be skipped
+        let event8 = AnthropicStreamEvent::Ping;
+        let chunk8 = convert_sse_event_to_openai(&event8, &mut state).unwrap();
+        assert!(chunk8.is_none());
+    }
+
+    /// Test single tool call streaming sequence
+    #[test]
+    fn test_anthropic_tool_call_streaming() {
+        let mut state = StreamState::new();
+
+        // 1. message_start
+        let event1 = AnthropicStreamEvent::MessageStart {
+            message: MessageStartData {
+                id: "msg_tool_123".to_string(),
+                model: "claude-sonnet-4-20250514".to_string(),
+                usage: None,
+            },
+        };
+        convert_sse_event_to_openai(&event1, &mut state).unwrap();
+
+        // 2. content_block_start (tool_use) - should emit tool call id and name
+        let event2 = AnthropicStreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlockStartData::ToolUse {
+                id: "toolu_abc123".to_string(),
+                name: "_meiliSearchInIndex".to_string(),
+            },
+        };
+        let chunk2 = convert_sse_event_to_openai(&event2, &mut state).unwrap();
+        assert!(chunk2.is_some());
+        let chunk2 = chunk2.unwrap();
+        let tool_calls = chunk2.choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].index, 0);
+        assert_eq!(tool_calls[0].id, Some("toolu_abc123".to_string()));
+        assert_eq!(tool_calls[0].function.as_ref().unwrap().name, Some("_meiliSearchInIndex".to_string()));
+
+        // 3. content_block_delta (input_json) - first part
+        let event3 = AnthropicStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentDelta::InputJsonDelta { partial_json: r#"{"q": "se"#.to_string() },
+        };
+        let chunk3 = convert_sse_event_to_openai(&event3, &mut state).unwrap();
+        assert!(chunk3.is_some());
+        let chunk3 = chunk3.unwrap();
+        let tool_calls = chunk3.choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls[0].function.as_ref().unwrap().arguments, Some(r#"{"q": "se"#.to_string()));
+
+        // 4. content_block_delta (input_json) - second part
+        let event4 = AnthropicStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentDelta::InputJsonDelta { partial_json: r#"arch"}"#.to_string() },
+        };
+        let chunk4 = convert_sse_event_to_openai(&event4, &mut state).unwrap();
+        assert!(chunk4.is_some());
+        let chunk4 = chunk4.unwrap();
+        let tool_calls = chunk4.choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls[0].function.as_ref().unwrap().arguments, Some(r#"arch"}"#.to_string()));
+
+        // 5. content_block_stop
+        let event5 = AnthropicStreamEvent::ContentBlockStop { index: 0 };
+        convert_sse_event_to_openai(&event5, &mut state).unwrap();
+
+        // Verify tool state was cleared
+        assert!(state.tool_state.is_empty());
+
+        // 6. message_delta with tool_use stop_reason
+        let event6 = AnthropicStreamEvent::MessageDelta {
+            delta: MessageDeltaData { stop_reason: Some("tool_use".to_string()) },
+            usage: Some(AnthropicUsage { input_tokens: 50, output_tokens: 25 }),
+        };
+        let chunk6 = convert_sse_event_to_openai(&event6, &mut state).unwrap();
+        assert!(chunk6.is_some());
+        let chunk6 = chunk6.unwrap();
+        assert_eq!(chunk6.choices[0].finish_reason, Some(FinishReason::ToolCalls));
+    }
+
+    /// Test multiple tool calls in a single response
+    #[test]
+    fn test_anthropic_multi_tool_streaming() {
+        let mut state = StreamState::new();
+
+        // Setup message_start
+        let event1 = AnthropicStreamEvent::MessageStart {
+            message: MessageStartData {
+                id: "msg_multi_tool".to_string(),
+                model: "claude-sonnet-4-20250514".to_string(),
+                usage: None,
+            },
+        };
+        convert_sse_event_to_openai(&event1, &mut state).unwrap();
+
+        // First tool: content_block_start
+        let event2 = AnthropicStreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlockStartData::ToolUse {
+                id: "toolu_first".to_string(),
+                name: "_meiliSearchInIndex".to_string(),
+            },
+        };
+        let chunk2 = convert_sse_event_to_openai(&event2, &mut state).unwrap().unwrap();
+        let tool_calls2 = chunk2.choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls2[0].index, 0);
+        assert_eq!(tool_calls2[0].id, Some("toolu_first".to_string()));
+
+        // First tool: arguments
+        let event3 = AnthropicStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentDelta::InputJsonDelta {
+                partial_json: r#"{"index_uid": "movies", "q": "action"}"#.to_string(),
+            },
+        };
+        let chunk3 = convert_sse_event_to_openai(&event3, &mut state).unwrap().unwrap();
+        let tool_calls3 = chunk3.choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls3[0].index, 0);
+
+        // First tool: stop
+        convert_sse_event_to_openai(
+            &AnthropicStreamEvent::ContentBlockStop { index: 0 },
+            &mut state,
+        )
+        .unwrap();
+
+        // Second tool: content_block_start
+        let event4 = AnthropicStreamEvent::ContentBlockStart {
+            index: 1,
+            content_block: ContentBlockStartData::ToolUse {
+                id: "toolu_second".to_string(),
+                name: "_meiliSearchInIndex".to_string(),
+            },
+        };
+        let chunk4 = convert_sse_event_to_openai(&event4, &mut state).unwrap().unwrap();
+        let tool_calls4 = chunk4.choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls4[0].index, 1); // OpenAI index should be 1
+        assert_eq!(tool_calls4[0].id, Some("toolu_second".to_string()));
+
+        // Verify internal state tracking
+        assert_eq!(state.tool_call_index, 2);
+        assert!(state.tool_state.contains_key(&1));
+    }
+
+    /// Test multi-turn conversation with tool results
+    #[test]
+    fn test_anthropic_multi_turn_with_tool_results() {
+        // Create a conversation with: user -> assistant (tool call) -> tool result -> user follow-up
+        let request = CreateChatCompletionRequest {
+            model: "claude-sonnet-4-20250514".to_string(),
+            messages: vec![
+                // Initial user message
+                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: async_openai::types::ChatCompletionRequestUserMessageContent::Text(
+                        "Search for sci-fi movies".to_string(),
+                    ),
+                    name: None,
+                }),
+                // Assistant's tool call response
+                ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+                    content: Some(
+                        async_openai::types::ChatCompletionRequestAssistantMessageContent::Text(
+                            "I'll search for sci-fi movies.".to_string(),
+                        ),
+                    ),
+                    tool_calls: Some(vec![ChatCompletionMessageToolCall {
+                        id: "call_scifi".to_string(),
+                        r#type: Some(ChatCompletionToolType::Function),
+                        function: FunctionCall {
+                            name: "_meiliSearchInIndex".to_string(),
+                            arguments: r#"{"index_uid": "movies", "q": "sci-fi"}"#.to_string(),
+                        },
+                    }]),
+                    name: None,
+                    refusal: None,
+                    audio: None,
+                    function_call: None,
+                }),
+                // Tool result
+                ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
+                    content: async_openai::types::ChatCompletionRequestToolMessageContent::Text(
+                        r#"{"hits": [{"title": "Blade Runner"}, {"title": "The Matrix"}]}"#
+                            .to_string(),
+                    ),
+                    tool_call_id: "call_scifi".to_string(),
+                }),
+                // Follow-up user message
+                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: async_openai::types::ChatCompletionRequestUserMessageContent::Text(
+                        "Tell me more about the first one".to_string(),
+                    ),
+                    name: None,
+                }),
+            ],
+            ..Default::default()
+        };
+
+        let anthropic_req = convert_request_to_anthropic(&request);
+
+        // Should have 4 messages: user, assistant, user (tool_result), user
+        assert_eq!(anthropic_req.messages.len(), 4);
+
+        // First: user message
+        assert_eq!(anthropic_req.messages[0].role, "user");
+        match &anthropic_req.messages[0].content {
+            AnthropicContent::Text(t) => assert!(t.contains("sci-fi")),
+            AnthropicContent::Blocks(b) => {
+                assert!(matches!(&b[0], ContentBlock::Text { text } if text.contains("sci-fi")))
+            }
+        }
+
+        // Second: assistant with tool_use
+        assert_eq!(anthropic_req.messages[1].role, "assistant");
+        match &anthropic_req.messages[1].content {
+            AnthropicContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                assert!(
+                    matches!(&blocks[1], ContentBlock::ToolUse { id, name, .. } if id == "call_scifi" && name == "_meiliSearchInIndex")
+                );
+            }
+            _ => panic!("Expected assistant with blocks"),
+        }
+
+        // Third: user with tool_result
+        assert_eq!(anthropic_req.messages[2].role, "user");
+        match &anthropic_req.messages[2].content {
+            AnthropicContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                match &blocks[0] {
+                    ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                        assert_eq!(tool_use_id, "call_scifi");
+                        assert!(content.contains("Blade Runner"));
+                        assert!(is_error.is_none());
+                    }
+                    _ => panic!("Expected ToolResult block"),
+                }
+            }
+            _ => panic!("Expected blocks content"),
+        }
+
+        // Fourth: user follow-up
+        assert_eq!(anthropic_req.messages[3].role, "user");
+    }
+
+    /// Test error event handling in streams
+    #[test]
+    fn test_anthropic_streaming_error_event() {
+        let mut state = StreamState::new();
+        state.message_id = "msg_error".to_string();
+        state.model = "claude-sonnet-4-20250514".to_string();
+
+        // Error event should return an error
+        let error_event = AnthropicStreamEvent::Error {
+            error: AnthropicError {
+                error_type: "overloaded_error".to_string(),
+                message: "The API is temporarily overloaded".to_string(),
+            },
+        };
+
+        let result = convert_sse_event_to_openai(&error_event, &mut state);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            AnthropicClientError::Api { error_type: AnthropicErrorType::Overloaded, .. }
+        ));
+        assert!(err.is_retryable());
+    }
+
+    /// Test all stop_reason to finish_reason mappings
+    #[test]
+    fn test_anthropic_all_stop_reason_mappings() {
+        let test_cases = vec![
+            ("end_turn", FinishReason::Stop),
+            ("max_tokens", FinishReason::Length),
+            ("stop_sequence", FinishReason::Stop),
+            ("tool_use", FinishReason::ToolCalls),
+            ("unknown_reason", FinishReason::Stop), // Unknown maps to Stop
+        ];
+
+        for (anthropic_reason, expected_finish) in test_cases {
+            let mut state = StreamState::new();
+            state.message_id = "msg_test".to_string();
+            state.model = "claude-sonnet-4".to_string();
+
+            let event = AnthropicStreamEvent::MessageDelta {
+                delta: MessageDeltaData { stop_reason: Some(anthropic_reason.to_string()) },
+                usage: None,
+            };
+
+            let chunk = convert_sse_event_to_openai(&event, &mut state).unwrap();
+            assert!(chunk.is_some(), "Expected chunk for stop_reason: {}", anthropic_reason);
+            let chunk = chunk.unwrap();
+            assert_eq!(
+                chunk.choices[0].finish_reason,
+                Some(expected_finish),
+                "Mismatch for stop_reason: {}",
+                anthropic_reason
+            );
+        }
+    }
+
+    /// Test rate limit error handling and response generation
+    #[test]
+    fn test_anthropic_rate_limit_error() {
+        let error = AnthropicClientError::from_anthropic_error(AnthropicError {
+            error_type: "rate_limit_error".to_string(),
+            message: "Number of request tokens has exceeded your daily rate limit".to_string(),
+        });
+
+        // Verify error properties
+        assert_eq!(error.error_code(), Code::TooManySearchRequests);
+        assert!(error.is_retryable());
+
+        // Verify stream error event generation
+        let event = error.into_stream_error_event();
+        assert_eq!(event.r#type, "error");
+        assert_eq!(event.error.r#type, "rate_limit_error");
+        assert_eq!(event.error.code, Some("rate_limit_error".to_string()));
+    }
+
+    /// Test authentication error handling
+    #[test]
+    fn test_anthropic_auth_error() {
+        let error = AnthropicClientError::from_anthropic_error(AnthropicError {
+            error_type: "authentication_error".to_string(),
+            message: "Invalid API Key".to_string(),
+        });
+
+        // Verify error properties
+        assert_eq!(error.error_code(), Code::InvalidChatCompletionApiKey);
+        assert!(!error.is_retryable());
+
+        // Verify message sanitization
+        if let AnthropicClientError::Api { message, .. } = &error {
+            assert!(!message.contains("API Key"));
+            assert!(message.contains("Invalid or missing"));
+        }
+    }
+
+    /// Test invalid request error handling
+    #[test]
+    fn test_anthropic_invalid_request_error() {
+        let error = AnthropicClientError::from_anthropic_error(AnthropicError {
+            error_type: "invalid_request_error".to_string(),
+            message: "max_tokens: value must be a positive integer".to_string(),
+        });
+
+        assert_eq!(error.error_code(), Code::BadRequest);
+        assert!(!error.is_retryable());
+
+        // Safe messages should pass through
+        if let AnthropicClientError::Api { message, .. } = &error {
+            assert_eq!(message, "max_tokens: value must be a positive integer");
+        }
+    }
+
+    /// Test response conversion with multiple content blocks (text + tool_use)
+    #[test]
+    fn test_anthropic_response_mixed_content() {
+        let response = AnthropicResponse {
+            id: "msg_mixed".to_string(),
+            response_type: "message".to_string(),
+            model: "claude-sonnet-4-20250514".to_string(),
+            content: vec![
+                ContentBlock::Text { text: "I found some results. Let me search again.".to_string() },
+                ContentBlock::ToolUse {
+                    id: "toolu_search1".to_string(),
+                    name: "_meiliSearchInIndex".to_string(),
+                    input: serde_json::json!({"index_uid": "products", "q": "laptop"}),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_search2".to_string(),
+                    name: "_meiliSearchInIndex".to_string(),
+                    input: serde_json::json!({"index_uid": "reviews", "q": "laptop review"}),
+                },
+            ],
+            stop_reason: Some("tool_use".to_string()),
+            usage: Some(AnthropicUsage { input_tokens: 100, output_tokens: 75 }),
+        };
+
+        let openai_response = convert_response_to_openai(response);
+
+        // Verify text content
+        assert_eq!(
+            openai_response.choices[0].message.content.as_deref(),
+            Some("I found some results. Let me search again.")
+        );
+
+        // Verify tool calls
+        let tool_calls = openai_response.choices[0].message.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 2);
+
+        assert_eq!(tool_calls[0].id, "toolu_search1");
+        assert_eq!(tool_calls[0].function.name, "_meiliSearchInIndex");
+        assert!(tool_calls[0].function.arguments.contains("laptop"));
+
+        assert_eq!(tool_calls[1].id, "toolu_search2");
+        assert!(tool_calls[1].function.arguments.contains("review"));
+
+        // Verify finish reason
+        assert_eq!(openai_response.choices[0].finish_reason, Some(FinishReason::ToolCalls));
+    }
+
+    /// Test that stream state resets correctly between messages
+    #[test]
+    fn test_anthropic_stream_state_reset() {
+        let mut state = StreamState::new();
+
+        // Simulate first message with tool use
+        let event1 = AnthropicStreamEvent::MessageStart {
+            message: MessageStartData {
+                id: "msg_1".to_string(),
+                model: "claude-sonnet-4".to_string(),
+                usage: None,
+            },
+        };
+        convert_sse_event_to_openai(&event1, &mut state).unwrap();
+
+        // Add tool state
+        let event2 = AnthropicStreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlockStartData::ToolUse {
+                id: "tool_1".to_string(),
+                name: "test_tool".to_string(),
+            },
+        };
+        convert_sse_event_to_openai(&event2, &mut state).unwrap();
+
+        assert_eq!(state.tool_call_index, 1);
+        assert!(!state.tool_state.is_empty());
+        assert_eq!(state.message_id, "msg_1");
+
+        // Simulate new message (should reset state)
+        let event3 = AnthropicStreamEvent::MessageStart {
+            message: MessageStartData {
+                id: "msg_2".to_string(),
+                model: "claude-sonnet-4".to_string(),
+                usage: None,
+            },
+        };
+        convert_sse_event_to_openai(&event3, &mut state).unwrap();
+
+        // State should be reset
+        assert_eq!(state.tool_call_index, 0);
+        assert!(state.tool_state.is_empty());
+        assert_eq!(state.message_id, "msg_2");
+    }
+
+    /// Test usage tracking in streaming responses
+    #[test]
+    fn test_anthropic_streaming_usage_tracking() {
+        let mut state = StreamState::new();
+        state.message_id = "msg_usage".to_string();
+        state.model = "claude-sonnet-4".to_string();
+
+        // message_delta with usage
+        let event = AnthropicStreamEvent::MessageDelta {
+            delta: MessageDeltaData { stop_reason: Some("end_turn".to_string()) },
+            usage: Some(AnthropicUsage { input_tokens: 150, output_tokens: 50 }),
+        };
+
+        let chunk = convert_sse_event_to_openai(&event, &mut state).unwrap().unwrap();
+
+        // Verify usage is included in the chunk
+        let usage = chunk.usage.as_ref().unwrap();
+        assert_eq!(usage.prompt_tokens, 150);
+        assert_eq!(usage.completion_tokens, 50);
+        assert_eq!(usage.total_tokens, 200);
+
+        // Verify state also tracks usage
+        let state_usage = state.usage.as_ref().unwrap();
+        assert_eq!(state_usage.prompt_tokens, 150);
+        assert_eq!(state_usage.completion_tokens, 50);
     }
 }

@@ -30,8 +30,10 @@ impl Config {
                 if let Some(api_key) = chat_settings.api_key.as_ref() {
                     config = config.with_api_key(api_key);
                 }
-                let base_url = chat_settings.base_url.as_deref();
-                if let Some(base_url) = chat_settings.source.base_url().or(base_url) {
+                // User-provided base_url takes priority, source default is fallback
+                if let Some(base_url) =
+                    chat_settings.base_url.as_deref().or(chat_settings.source.base_url())
+                {
                     config = config.with_api_base(base_url);
                 }
                 Self::OpenAiCompatible(config)
