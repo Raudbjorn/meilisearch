@@ -8,7 +8,6 @@ fn test_valid_opt() {
 }
 
 #[test]
-#[ignore]
 fn test_meilli_config_file_path_valid() {
     temp_env::with_vars(
         vec![("MEILI_CONFIG_FILE_PATH", Some("../config.toml"))], // Relative path in meilisearch package
@@ -19,7 +18,6 @@ fn test_meilli_config_file_path_valid() {
 }
 
 #[test]
-#[ignore]
 fn test_meilli_config_file_path_invalid() {
     temp_env::with_vars(vec![("MEILI_CONFIG_FILE_PATH", Some("../configgg.toml"))], || {
         let possible_error_messages = [

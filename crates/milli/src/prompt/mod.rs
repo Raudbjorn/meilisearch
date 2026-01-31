@@ -199,7 +199,6 @@ mod test {
     }
 
     #[test]
-    #[ignore] // See <https://github.com/meilisearch/meilisearch/pull/5593> for explanation
     fn template_missing_doc() {
         assert!(matches!(
             Prompt::new("{{title}}: {{overview}}".into(), None),
@@ -230,7 +229,6 @@ mod test {
     }
 
     #[test]
-    #[ignore] // See <https://github.com/meilisearch/meilisearch/pull/5593> for explanation
     fn template_fields_invalid() {
         assert!(matches!(
             // intentionally garbled field

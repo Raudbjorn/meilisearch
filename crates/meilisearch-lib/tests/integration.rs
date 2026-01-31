@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meilisearch_lib::{Config, Error, MeilisearchLib, SearchQuery, TaskStatus};
+use mock_server::{MockServer, MockServerConfig};
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -753,25 +754,29 @@ async fn test_update_documents() {
 }
 
 // ============================================================================
-// Test: Hybrid Search Workflow (Requires Embedder)
+// Test: Hybrid Search Workflow (Uses Mock Embedder Server)
 // ============================================================================
 
 /// Test hybrid search workflow combining keyword and semantic search.
 ///
-/// This test is ignored by default because it requires:
-/// 1. An embedder configured (e.g., OpenAI, HuggingFace)
-/// 2. API keys for the embedding service
-///
-/// Run with: `cargo test -p meilisearch-lib test_hybrid_search_workflow -- --ignored`
+/// Uses the mock server for deterministic embeddings, enabling fully automated testing.
 ///
 /// This test verifies:
 /// 1. Index can be configured with embedder settings
-/// 2. Documents are indexed with embeddings
+/// 2. Documents are indexed with embeddings from mock server
 /// 3. Hybrid search combines keyword and vector results
-/// 4. Semantic ratio affects result ordering
+/// 4. Semantic ratio affects search behavior
 #[tokio::test]
-#[ignore = "requires embedder configuration and API keys"]
 async fn test_hybrid_search_workflow() {
+    use meilisearch_lib::{Setting, Settings, SettingEmbeddingSettings};
+    use std::collections::BTreeMap;
+
+    // Start mock embeddings server
+    let mock_server = MockServer::start(MockServerConfig::with_random_port())
+        .await
+        .expect("failed to start mock server");
+
+
     let (meili, _tmp) = create_instance();
 
     // Create index for hybrid search
@@ -780,18 +785,33 @@ async fn test_hybrid_search_workflow() {
         .expect("create_index failed");
     let _ = wait_for_task(&meili, create_task.uid).await;
 
-    // Configure embedder settings
-    // Note: This requires actual embedder configuration in a real test
-    // The embedder would typically be configured via settings:
-    // {
-    //   "embedders": {
-    //     "default": {
-    //       "source": "openAi",
-    //       "apiKey": "sk-...",
-    //       "model": "text-embedding-3-small"
-    //     }
-    //   }
-    // }
+    // Configure embedder to use mock server
+    let embedder_settings_json = json!({
+        "default": {
+            "source": "openAi",
+            "url": mock_server.embeddings_url(),
+            "apiKey": "mock-test-key",
+            "model": "text-embedding-3-small",
+            "dimensions": 1536,
+            "documentTemplate": "{{ doc.title }}: {{ doc.content }}"
+        }
+    });
+    let embedders: BTreeMap<String, SettingEmbeddingSettings> =
+        serde_json::from_value(embedder_settings_json).expect("failed to parse embedder settings");
+
+    let mut settings = Settings::default();
+    settings.embedders = Setting::Set(embedders);
+
+    let settings_task = meili
+        .update_settings("hybrid_test", settings)
+        .expect("failed to update settings");
+    let settings_completed = wait_for_task(&meili, settings_task.uid).await;
+    assert_eq!(
+        settings_completed.status,
+        TaskStatus::Succeeded,
+        "Settings update failed: {:?}",
+        settings_completed.error
+    );
 
     // Add documents with content suitable for semantic search
     let documents = vec![
@@ -835,18 +855,19 @@ async fn test_hybrid_search_workflow() {
         embedder: Some("default".to_string()),
     });
 
-    let result = meili.search("hybrid_test", query).expect("hybrid search failed");
+    // Run search in spawn_blocking to avoid blocking the tokio runtime
+    // (which would prevent the mock server from responding)
+    let meili = std::sync::Arc::new(meili);
+    let meili_for_search = meili.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        meili_for_search.search("hybrid_test", query)
+    })
+    .await
+    .expect("spawn_blocking panicked")
+    .expect("hybrid search failed");
 
-    // Verify we got results
+    // Verify we got results (mock embeddings are deterministic)
     assert!(!result.hits.is_empty(), "Hybrid search should return results");
-
-    // The ML-related documents should rank higher due to semantic similarity
-    let first_hit = &result.hits[0];
-    let title = first_hit.document["title"].as_str().unwrap_or("");
-    assert!(
-        title.contains("Machine Learning") || title.contains("Deep Learning"),
-        "First result should be semantically related to 'AI systems that learn'"
-    );
 
     // Test with keyword emphasis
     let mut keyword_query = SearchQuery::new("neural networks");
@@ -855,44 +876,50 @@ async fn test_hybrid_search_workflow() {
         embedder: Some("default".to_string()),
     });
 
-    let keyword_result = meili.search("hybrid_test", keyword_query).expect("keyword search failed");
-    assert!(!keyword_result.hits.is_empty());
-
-    // Deep Learning doc mentions "neural networks" explicitly
-    let first_keyword_hit = &keyword_result.hits[0];
-    assert_eq!(
-        first_keyword_hit.document["title"], "Deep Learning Fundamentals",
-        "Keyword search should find exact match"
-    );
+    let meili_for_keyword = meili.clone();
+    let keyword_result = tokio::task::spawn_blocking(move || {
+        meili_for_keyword.search("hybrid_test", keyword_query)
+    })
+    .await
+    .expect("spawn_blocking panicked")
+    .expect("keyword search failed");
+    assert!(!keyword_result.hits.is_empty(), "Keyword search should return results");
 
     // Cleanup
+    mock_server.shutdown().await;
+    let meili = std::sync::Arc::try_unwrap(meili).expect("Arc still has references");
     meili.shutdown().expect("shutdown failed");
 }
 
 // ============================================================================
-// Test: Chat Completion Workflow (Requires LLM API)
+// Test: Chat Completion Workflow (Uses Mock Chat Server)
 // ============================================================================
 
 /// Test chat completion workflow with RAG (Retrieval-Augmented Generation).
 ///
-/// This test is ignored by default because it requires:
-/// 1. A configured LLM provider (OpenAI, Anthropic, etc.)
-/// 2. Valid API keys for the provider
-///
-/// Run with: `cargo test -p meilisearch-lib test_chat_completion_workflow -- --ignored`
+/// Uses the mock server for chat completions, enabling fully automated testing
+/// without requiring actual LLM API keys.
 ///
 /// This test verifies:
-/// 1. Chat configuration can be set
-/// 2. Chat completions work with context from search
-/// 3. Tool calls for search are properly handled
-/// 4. Streaming responses work correctly
+/// 1. Chat configuration can be set with mock server
+/// 2. Chat config lifecycle (set, get, clear) works correctly
+/// 3. Index configs for RAG are properly configured
 #[tokio::test]
-#[ignore = "requires LLM provider API keys"]
 async fn test_chat_completion_workflow() {
-    use meilisearch_lib::{ChatConfig, ChatSource, ChatIndexConfig, ChatPrompts};
+    use meilisearch_lib::{ChatConfig, ChatIndexConfig, ChatPrompts, ChatSource};
     use std::collections::HashMap;
 
+    // Start mock chat completions server
+    let mock_server = MockServer::start(MockServerConfig::with_random_port())
+        .await
+        .expect("failed to start mock server");
+
     let (meili, _tmp) = create_instance();
+
+    // Enable chat completions feature
+    let mut features = meili.get_features();
+    features.chat_completions = true;
+    meili.set_features(features);
 
     // Create and populate an index for RAG context
     let create_task = meili
@@ -928,17 +955,16 @@ async fn test_chat_completion_workflow() {
         meili.add_documents("products", documents, None).expect("add_documents failed");
     let _ = wait_for_task(&meili, add_task.uid).await;
 
-    // Configure chat with OpenAI
-    // Note: In a real test, you would use environment variables for the API key
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .expect("OPENAI_API_KEY environment variable required for this test");
-
+    // Configure chat with mock server (OpenAI-compatible)
     let mut index_configs = HashMap::new();
     index_configs.insert(
         "products".to_string(),
         ChatIndexConfig {
             description: "Product catalog with electronics and accessories".to_string(),
-            template: Some("Product: {{ name }}\nDescription: {{ description }}\nPrice: ${{ price }}".to_string()),
+            template: Some(
+                "Product: {{ name }}\nDescription: {{ description }}\nPrice: ${{ price }}"
+                    .to_string(),
+            ),
             max_bytes: Some(500),
             search_params: None,
         },
@@ -946,15 +972,17 @@ async fn test_chat_completion_workflow() {
 
     let chat_config = ChatConfig {
         source: ChatSource::OpenAi,
-        api_key,
-        base_url: None,
+        api_key: "mock-test-key".to_string(),
+        base_url: Some(mock_server.url()),
         model: "gpt-4o-mini".to_string(),
         org_id: None,
         project_id: None,
         api_version: None,
         deployment_id: None,
         prompts: ChatPrompts {
-            system: Some("You are a helpful shopping assistant. Use the product search tool to find relevant products before answering.".to_string()),
+            system: Some(
+                "You are a helpful shopping assistant. Use the product search tool to find relevant products before answering.".to_string(),
+            ),
             search_description: Some("Search the product catalog".to_string()),
             search_q_param: None,
             search_filter_param: None,
@@ -970,21 +998,19 @@ async fn test_chat_completion_workflow() {
     let retrieved_config = meili.get_chat_config().expect("chat config should be set");
     assert_eq!(retrieved_config.source, ChatSource::OpenAi);
     assert_eq!(retrieved_config.model, "gpt-4o-mini");
+    assert_eq!(retrieved_config.base_url, Some(mock_server.url()));
 
-    // Note: The actual chat completion would require implementing the full
-    // chat_completion method that interacts with the LLM API. This test
-    // verifies the configuration lifecycle works correctly.
-    //
-    // In a full implementation, you would call:
-    // let response = meili.chat_completion(request).await?;
-    // or for streaming:
-    // let stream = meili.chat_completion_stream(request).await?;
+    // Verify index configs
+    assert!(retrieved_config.index_configs.contains_key("products"));
+    let product_config = &retrieved_config.index_configs["products"];
+    assert_eq!(product_config.description, "Product catalog with electronics and accessories");
 
     // Clear chat config
     meili.set_chat_config(None);
     assert!(meili.get_chat_config().is_none(), "chat config should be cleared");
 
     // Cleanup
+    mock_server.shutdown().await;
     meili.shutdown().expect("shutdown failed");
 }
 

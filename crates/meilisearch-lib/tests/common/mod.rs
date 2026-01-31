@@ -384,3 +384,35 @@ pub fn shared_client(ctx: &TestContext) -> Arc<MeilisearchLib> {
         See test_concurrent_operations for the pattern."
     )
 }
+
+// ============================================================================
+// Mock Server Utilities
+// ============================================================================
+
+pub use mock_server::{MockServer, MockServerConfig};
+
+/// Start a mock server for embedder testing.
+///
+/// Returns the mock server instance. Call `server.embeddings_url()` to get
+/// the URL for configuring embedders.
+pub async fn start_mock_server() -> MockServer {
+    MockServer::start(MockServerConfig::with_random_port())
+        .await
+        .expect("failed to start mock server")
+}
+
+/// Create embedder settings JSON for use with the mock server.
+///
+/// Returns settings suitable for `update_settings` with embedders configured
+/// to use the mock server's embeddings endpoint.
+pub fn mock_embedder_settings(mock_url: &str, embedder_name: &str) -> serde_json::Value {
+    json!({
+        embedder_name: {
+            "source": "openAi",
+            "url": mock_url,
+            "apiKey": "mock-test-key",
+            "model": "text-embedding-3-small",
+            "dimensions": 1536
+        }
+    })
+}

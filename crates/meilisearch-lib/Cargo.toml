@@ -36,3 +36,4 @@ byte-unit = "5"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+mock-server = { path = "../mock-server" }

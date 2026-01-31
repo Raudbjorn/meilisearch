@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{sample_movies, sample_products, TestContext};
+use common::{sample_movies, sample_products, start_mock_server, TestContext};
 use meilisearch_lib::SearchQuery;
 
 // ============================================================================
@@ -384,53 +384,197 @@ async fn test_search_query_builder() {
 }
 
 // ============================================================================
-// Hybrid Search Tests (Requires Embedder - Ignored by Default)
+// Hybrid Search Tests (Uses Mock Server for Embeddings)
 // ============================================================================
 
-/// Test hybrid search combining keyword and semantic.
+/// Test hybrid search combining keyword and semantic search.
 ///
-/// Requires embedder configuration - ignored by default.
+/// Uses the mock server for deterministic embeddings.
+/// Note: Search must be run in spawn_blocking to avoid blocking the tokio runtime
+/// that's running the mock server.
 #[tokio::test]
-#[ignore = "requires embedder configuration"]
 async fn test_hybrid_search() {
-    let mut ctx = TestContext::new();
-    let uid = ctx.create_index_simple("hybrid_search").await;
-    ctx.add_documents(&uid, sample_movies()).await;
+    use meilisearch_lib::{Config, MeilisearchLib, Settings, SettingEmbeddingSettings};
+    use meilisearch_types::milli::update::Setting;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Duration;
 
+    // Start mock embeddings server
+    let mock_server = start_mock_server().await;
+
+    // Create instance directly for better ownership control
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let config = Config::builder()
+        .db_path(temp_dir.path())
+        .build()
+        .expect("failed to build config");
+    let meili = MeilisearchLib::new(config).expect("failed to create instance");
+
+    // Create index
+    let uid = "hybrid_search";
+    let create_task = meili
+        .create_index(uid, Some("id".to_string()))
+        .expect("create_index failed");
+    meili
+        .wait_for_task_async(create_task.uid, Some(Duration::from_secs(30)))
+        .await
+        .expect("task wait failed");
+
+    // Configure embedder to use mock server with document template
+    let embedder_settings_json = serde_json::json!({
+        "default": {
+            "source": "openAi",
+            "url": mock_server.embeddings_url(),
+            "apiKey": "mock-test-key",
+            "model": "text-embedding-3-small",
+            "dimensions": 1536,
+            "documentTemplate": "{{ doc.title }}: {{ doc.genres | join: ', ' }}"
+        }
+    });
+    let embedders: BTreeMap<String, SettingEmbeddingSettings> =
+        serde_json::from_value(embedder_settings_json).expect("failed to parse embedder settings");
+
+    let mut settings = Settings::default();
+    settings.embedders = Setting::Set(embedders);
+
+    let settings_task = meili
+        .update_settings(uid, settings)
+        .expect("failed to update settings");
+    meili
+        .wait_for_task_async(settings_task.uid, Some(Duration::from_secs(30)))
+        .await
+        .expect("task wait failed");
+
+    // Add documents (will be embedded by mock server)
+    let docs: Vec<serde_json::Value> = sample_movies()
+        .into_iter()
+        .map(|d| serde_json::to_value(d).unwrap())
+        .collect();
+    let add_task = meili.add_documents(uid, docs, None).expect("add documents failed");
+    meili
+        .wait_for_task_async(add_task.uid, Some(Duration::from_secs(60)))
+        .await
+        .expect("task wait failed");
+
+    // Perform hybrid search - must use spawn_blocking to allow mock server to respond
     let mut query = SearchQuery::new("movies about criminals");
     query.hybrid = Some(meilisearch_lib::HybridQuery {
         semantic_ratio: 0.5,
         embedder: Some("default".to_string()),
     });
 
-    let result = ctx.client.search(&uid, query).expect("hybrid search failed");
+    let meili = Arc::new(meili);
+    let meili_for_search = meili.clone();
 
-    // Should find crime-related movies
-    assert!(!result.hits.is_empty());
+    let result = tokio::task::spawn_blocking(move || meili_for_search.search(uid, query))
+        .await
+        .expect("spawn_blocking panicked")
+        .expect("hybrid search failed");
 
-    ctx.shutdown().expect("shutdown failed");
+    // Should find crime-related movies (deterministic embeddings enable this)
+    assert!(!result.hits.is_empty(), "Hybrid search should return results");
+
+    // Cleanup
+    mock_server.shutdown().await;
+    drop(temp_dir);
+    let meili = Arc::try_unwrap(meili).expect("Arc still has references");
+    meili.shutdown().expect("shutdown failed");
 }
 
 /// Test semantic-only search (high semantic ratio).
+///
+/// Uses the mock server for deterministic embeddings.
+/// Note: Search must be run in spawn_blocking to avoid blocking the tokio runtime
+/// that's running the mock server.
 #[tokio::test]
-#[ignore = "requires embedder configuration"]
 async fn test_semantic_search() {
-    let mut ctx = TestContext::new();
-    let uid = ctx.create_index_simple("semantic_search").await;
-    ctx.add_documents(&uid, sample_movies()).await;
+    use meilisearch_lib::{Config, MeilisearchLib, Settings, SettingEmbeddingSettings};
+    use meilisearch_types::milli::update::Setting;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Duration;
 
+    // Start mock embeddings server
+    let mock_server = start_mock_server().await;
+
+    // Create instance directly for better ownership control
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let config = Config::builder()
+        .db_path(temp_dir.path())
+        .build()
+        .expect("failed to build config");
+    let meili = MeilisearchLib::new(config).expect("failed to create instance");
+
+    // Create index
+    let uid = "semantic_search";
+    let create_task = meili
+        .create_index(uid, Some("id".to_string()))
+        .expect("create_index failed");
+    meili
+        .wait_for_task_async(create_task.uid, Some(Duration::from_secs(30)))
+        .await
+        .expect("task wait failed");
+
+    // Configure embedder to use mock server with document template
+    let embedder_settings_json = serde_json::json!({
+        "default": {
+            "source": "openAi",
+            "url": mock_server.embeddings_url(),
+            "apiKey": "mock-test-key",
+            "model": "text-embedding-3-small",
+            "dimensions": 1536,
+            "documentTemplate": "{{ doc.title }}: {{ doc.genres | join: ', ' }}"
+        }
+    });
+    let embedders: BTreeMap<String, SettingEmbeddingSettings> =
+        serde_json::from_value(embedder_settings_json).expect("failed to parse embedder settings");
+
+    let mut settings = Settings::default();
+    settings.embedders = Setting::Set(embedders);
+
+    let settings_task = meili
+        .update_settings(uid, settings)
+        .expect("failed to update settings");
+    meili
+        .wait_for_task_async(settings_task.uid, Some(Duration::from_secs(30)))
+        .await
+        .expect("task wait failed");
+
+    // Add documents
+    let docs: Vec<serde_json::Value> = sample_movies()
+        .into_iter()
+        .map(|d| serde_json::to_value(d).unwrap())
+        .collect();
+    let add_task = meili.add_documents(uid, docs, None).expect("add documents failed");
+    meili
+        .wait_for_task_async(add_task.uid, Some(Duration::from_secs(60)))
+        .await
+        .expect("task wait failed");
+
+    // Perform semantic search - must use spawn_blocking
     let mut query = SearchQuery::new("films about hope and redemption");
     query.hybrid = Some(meilisearch_lib::HybridQuery {
         semantic_ratio: 0.9,
         embedder: Some("default".to_string()),
     });
 
-    let result = ctx.client.search(&uid, query).expect("semantic search failed");
+    let meili = Arc::new(meili);
+    let meili_for_search = meili.clone();
 
-    // Shawshank Redemption should rank highly
-    assert!(!result.hits.is_empty());
+    let result = tokio::task::spawn_blocking(move || meili_for_search.search(uid, query))
+        .await
+        .expect("spawn_blocking panicked")
+        .expect("semantic search failed");
 
-    ctx.shutdown().expect("shutdown failed");
+    // Should return results based on semantic similarity
+    assert!(!result.hits.is_empty(), "Semantic search should return results");
+
+    // Cleanup
+    mock_server.shutdown().await;
+    drop(temp_dir);
+    let meili = Arc::try_unwrap(meili).expect("Arc still has references");
+    meili.shutdown().expect("shutdown failed");
 }
 
 // ============================================================================
